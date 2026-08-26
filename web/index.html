@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Pushpak · Real-time Airfare Price Index</title>
+    <meta
+      name="description"
+      content="A daily, route-level airfare price index for India, built on DGCA passenger weights and CPI-standard index methodology. Prototype for MoSPI's Data Informatics and Innovation Division."
+    />
+    <script>
+      // Stamp the theme before first paint. Without this a reader who chose
+      // dark gets a white flash on every navigation. Light is the default, so
+      // an unset preference needs no stamp and no work.
+      (function () {
+        try {
+          var t = localStorage.getItem("pushpak-theme");
+          if (t === "dark") document.documentElement.dataset.theme = "dark";
+        } catch (e) {
+          /* private mode or blocked storage: fall through to light */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.jsx"></script>
+  </body>
+</html>

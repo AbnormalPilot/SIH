@@ -1,0 +1,319 @@
+"""Pushpak configuration: the basket, the weights, and their provenance.
+
+Everything that a reviewer would want to audit lives here as data, not as
+magic numbers scattered through the code.  Each weight set carries an explicit
+``provenance`` tag so the README's honesty claims are machine-checkable:
+
+  DGCA_DERIVED   -> computed from the official DGCA city-pair traffic release
+                    that ships in data/. Reproducible via scripts/build_weights.py
+  ASSUMED_PRIOR  -> a documented modelling assumption, NOT an official statistic.
+                    Must be replaced with real booking-curve data before any
+                    production use.
+"""
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# --------------------------------------------------------------------------
+# Paths
+# --------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = ROOT / "data"
+DB_PATH = Path(os.environ.get("PUSHPAK_DB", DATA_DIR / "pushpak.db"))
+AUDIT_LOG_PATH = Path(os.environ.get("PUSHPAK_AUDIT_LOG", DATA_DIR / "scrape_audit.jsonl"))
+DGCA_TRAFFIC_CSV = DATA_DIR / "dgca_domestic_city_pair_traffic.csv"
+ROUTE_WEIGHTS_CSV = DATA_DIR / "route_weights.csv"
+DGCA_FARE_BENCHMARK_CSV = DATA_DIR / "dgca_fare_benchmark.csv"
+
+# --------------------------------------------------------------------------
+# 1. THE BASKET  (component 1: route selection)
+# --------------------------------------------------------------------------
+# Chosen as the top-5 domestic city pairs by passengers carried over the most
+# recent 12 months in the DGCA release shipped in data/.  Together they carry
+# ~12.9% of ALL Indian domestic passengers.  Weights are recomputed from that
+# file by scripts/build_weights.py — they are never hand-typed.
+
+IATA = {
+    "DELHI": "DEL",
+    "MUMBAI": "BOM",
+    "BENGALURU": "BLR",
+    "HYDERABAD": "HYD",
+    "KOLKATA": "CCU",
+    "CHENNAI": "MAA",
+    "PUNE": "PNQ",
+    "AHMEDABAD": "AMD",
+}
+
+# DGCA renamed Mumbai's entry when Navi Mumbai (NMIA) opened, splitting one
+# city into three labels mid-series.  Left unhandled this silently halves the
+# busiest route in the country.  Metro-area is the correct unit for a city-pair
+# fare index, so the three labels collapse to one city.
+DGCA_CITY_ALIASES = {
+    "MUMBAI (MUMBAI)": "MUMBAI",
+    "MUMBAI (NAVI MUMBAI)": "MUMBAI",
+    "GOA (DABOLIM, SOUTH GOA)": "GOA",
+    "GOA (MOPA, NORTH GOA)": "GOA",
+    "MOPA, GOA": "GOA",
+}
+
+BASKET_SIZE = 5
+TRAFFIC_WINDOW_MONTHS = 12
+
+
+@dataclass(frozen=True)
+class Route:
+    """One elementary route in the fixed basket."""
+    route_id: str          # canonical undirected id, e.g. "BLR-DEL"
+    city_a: str
+    city_b: str
+    iata_a: str
+    iata_b: str
+    weight: float          # share of basket passengers (sums to 1.0 across basket)
+    annual_pax: float
+    national_share: float  # share of ALL domestic pax, for context
+
+    @property
+    def legs(self) -> list[tuple[str, str]]:
+        """Both directional legs. Fares are directional; weights are not."""
+        return [(self.iata_a, self.iata_b), (self.iata_b, self.iata_a)]
+
+
+# --------------------------------------------------------------------------
+# 2. ADVANCE-PURCHASE WINDOWS  (component 1: AP granularity)
+# --------------------------------------------------------------------------
+# The brief's T+1 / T+7 / T+15 / T+30. Each (route, AP window) pair is one
+# "elementary aggregate" cell in CPI terminology.
+ADVANCE_PURCHASE_WINDOWS: tuple[int, ...] = (1, 7, 15, 30)
+
+# Within-route weights across AP windows. These approximate the domestic
+# booking curve (most Indian domestic leisure+business booking is short-lead).
+#
+#   *** PROVENANCE: ASSUMED_PRIOR — this is NOT an official statistic. ***
+#
+# A production Pushpak would source these from airline/OTA booking-date
+# distributions obtained under a data-sharing MoU (see README §Ethics).
+# They are kept here, versioned and normalised, precisely so a reviewer can
+# see exactly which part of the index rests on an assumption.
+AP_WINDOW_WEIGHTS: dict[int, float] = {
+    1: 0.20,   # walk-up / last-minute, disproportionately business travel
+    7: 0.30,
+    15: 0.28,
+    30: 0.22,
+}
+AP_WINDOW_WEIGHT_PROVENANCE = "ASSUMED_PRIOR"
+ROUTE_WEIGHT_PROVENANCE = "DGCA_DERIVED"
+
+# --------------------------------------------------------------------------
+# 3. INDEX PARAMETERS  (component 3)
+# --------------------------------------------------------------------------
+BASE_INDEX_VALUE = 100.0
+BASE_PERIOD_DAYS = 3          # base price = mean cell price over first N days
+MAX_CARRY_FORWARD_DAYS = 7    # staleness cap on last-observation-carried-forward
+OUTLIER_MULTIPLE = 5.0        # a quote > 5x the cell median is treated as bad data
+MIN_QUOTES_PER_CELL = 1       # below this a cell is "thin" and gets flagged
+
+# Quality thresholds surfaced in the API/UI so consumers can gate on them.
+QUALITY_THRESHOLDS = {
+    "green": {"max_imputed_share": 0.10, "max_synthetic_share": 0.00},
+    "amber": {"max_imputed_share": 0.30, "max_synthetic_share": 1.00},
+    # anything worse is "red"
+}
+
+# --------------------------------------------------------------------------
+# 4. SOURCES  (component 1: >=1 airline site + >=1 OTA)
+# --------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Source:
+    name: str
+    source_type: str          # "AIRLINE" | "OTA"
+    base_url: str
+    robots_url: str
+    # A URL *pattern* is logged for audit rather than only the concrete URL,
+    # so the audit trail shows the access shape without hoarding query strings.
+    search_url_pattern: str
+    min_seconds_between_requests: float = 6.0
+    enabled: bool = True
+
+
+SOURCES: tuple[Source, ...] = (
+    # ---- AIRLINE sources -------------------------------------------------
+    Source(
+        name="goindigo.in",
+        source_type="AIRLINE",
+        base_url="https://www.goindigo.in",
+        robots_url="https://www.goindigo.in/robots.txt",
+        search_url_pattern="https://www.goindigo.in/booking/flight-select.html?origin={origin}&destination={dest}&departureDate={travel_date}",
+        min_seconds_between_requests=8.0,
+    ),
+    Source(
+        name="airindia.com",
+        source_type="AIRLINE",
+        base_url="https://www.airindia.com",
+        robots_url="https://www.airindia.com/robots.txt",
+        search_url_pattern="https://www.airindia.com/in/en/book/flight-search.html?origin={origin}&destination={dest}&departureDate={travel_date}",
+        min_seconds_between_requests=8.0,
+    ),
+    # ---- OTA / metasearch sources ---------------------------------------
+    Source(
+        name="skyscanner.co.in",
+        source_type="OTA",
+        base_url="https://www.skyscanner.co.in",
+        robots_url="https://www.skyscanner.co.in/robots.txt",
+        # Skyscanner's fare pages live under /transport/flights/... , which its
+        # robots.txt Disallows for User-agent: * . The gate in collect/robots.py
+        # therefore refuses this source by design -- see README section 5.
+        search_url_pattern="https://www.skyscanner.co.in/transport/flights/{origin}/{dest}/{travel_date_compact}/",
+        min_seconds_between_requests=6.0,
+    ),
+    Source(
+        name="cleartrip.com",
+        source_type="OTA",
+        base_url="https://www.cleartrip.com",
+        robots_url="https://www.cleartrip.com/robots.txt",
+        search_url_pattern="https://www.cleartrip.com/flights/search?from={origin}&to={dest}&depart_date={travel_date}&adults=1&class=Economy",
+        min_seconds_between_requests=8.0,
+    ),
+    Source(
+        name="ixigo.com",
+        source_type="OTA",
+        base_url="https://www.ixigo.com",
+        robots_url="https://www.ixigo.com/robots.txt",
+        search_url_pattern="https://www.ixigo.com/search/result/flight?from={origin}&to={dest}&date={travel_date}&adults=1&class=e",
+        min_seconds_between_requests=8.0,
+    ),
+    # These two permit crawling. SpiceJet's robots.txt allows everything except
+    # /cgi-bin/, /api/v1, /public/ and /externalBooking; Akasa Air publishes a
+    # robots.txt with no Disallow at all. They are in the basket precisely so
+    # the gate is demonstrably discriminating rather than blanket-refusing.
+    Source(
+        name="spicejet.com",
+        source_type="AIRLINE",
+        base_url="https://www.spicejet.com",
+        robots_url="https://www.spicejet.com/robots.txt",
+        # NOT /api/v1: SpiceJet disallows its booking API by absolute URL, and
+        # the gate honours that (see collect/robots.py). We use the public page.
+        search_url_pattern="https://www.spicejet.com/?departure={origin}&arrival={dest}&departureDate={travel_date}&adult=1",
+        min_seconds_between_requests=8.0,
+    ),
+    Source(
+        name="akasaair.com",
+        source_type="AIRLINE",
+        base_url="https://www.akasaair.com",
+        robots_url="https://www.akasaair.com/robots.txt",
+        search_url_pattern="https://www.akasaair.com/book-flight-tickets?origin={origin}&destination={dest}&departureDate={travel_date}",
+        min_seconds_between_requests=8.0,
+    ),
+    Source(
+        name="easemytrip.com",
+        source_type="OTA",
+        base_url="https://www.easemytrip.com",
+        robots_url="https://www.easemytrip.com/robots.txt",
+        search_url_pattern="https://www.easemytrip.com/flight-search/listing?from={origin}&to={dest}&date={travel_date}",
+        min_seconds_between_requests=8.0,
+    ),
+)
+
+# Official partner APIs that a production Pushpak should use INSTEAD of scraping.
+# Recorded here because the brief asks what a production version would do
+# differently: it would sign data-sharing agreements, not scrape harder.
+OFFICIAL_DATA_CHANNELS = {
+    "skyscanner.co.in": {
+        "channel": "Skyscanner Partners - Flights Live Prices / Indicative Prices API",
+        "url": "https://www.partners.skyscanner.net/product/travel-api",
+        "access": "PARTNER_ONLY_APPLICATION_REQUIRED",
+        "note": "Closed API. Approval is discretionary and typically takes ~2 weeks.",
+    },
+    "goindigo.in": {
+        "channel": "Airline distribution feed / NDC or direct MoU with MoSPI",
+        "url": "https://www.goindigo.in",
+        "access": "COMMERCIAL_AGREEMENT_REQUIRED",
+        "note": "Preferred production channel: statutory data-sharing MoU.",
+    },
+    "airindia.com": {
+        "channel": "Airline distribution feed / NDC or direct MoU with MoSPI",
+        "url": "https://www.airindia.com",
+        "access": "COMMERCIAL_AGREEMENT_REQUIRED",
+        "note": "Preferred production channel: statutory data-sharing MoU.",
+    },
+    "spicejet.com": {
+        "channel": "Airline distribution feed or MoU",
+        "url": "https://www.spicejet.com",
+        "access": "CRAWLING_PERMITTED_BUT_NO_STATIC_FARES",
+        "note": (
+            "robots.txt permits the public search page, but fares are rendered "
+            "client-side from /api/v1, which robots.txt disallows. Compliant "
+            "static collection therefore yields no prices."
+        ),
+    },
+    "akasaair.com": {
+        "channel": "Airline distribution feed or MoU",
+        "url": "https://www.akasaair.com",
+        "access": "CRAWLING_PERMITTED_BUT_NO_STATIC_FARES",
+        "note": (
+            "robots.txt contains no Disallow at all. Fares are still rendered "
+            "client-side, so a compliant static client sees promotional banners "
+            "rather than route-level quotes."
+        ),
+    },
+    "amadeus": {
+        "channel": "Amadeus for Developers, Flight Offers Search",
+        "url": "https://developers.amadeus.com",
+        "access": "SELF_SERVICE_API_KEY",
+        "note": (
+            "Free self-service test tier with real airline content. This is the "
+            "supported way to obtain live fares without scraping, and Pushpak "
+            "uses it when AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET are set."
+        ),
+    },
+    "_general": {
+        "channel": "DGCA Tariff Monitoring Unit fare submissions",
+        "url": "https://www.dgca.gov.in",
+        "access": "GOVT_TO_GOVT",
+        "note": (
+            "Airlines already file fare data with DGCA's Tariff Monitoring Unit. "
+            "The cheapest production path for MoSPI is an inter-departmental "
+            "feed from DGCA, not scraping OTAs at all."
+        ),
+    },
+}
+
+# Carriers modelled by the synthetic generator and expected from live parsing.
+CARRIERS = {
+    "6E": "IndiGo",
+    "AI": "Air India",
+    "IX": "Air India Express",
+    "QP": "Akasa Air",
+    "SG": "SpiceJet",
+}
+
+FARE_CLASSES = ("ECONOMY",)
+
+# --------------------------------------------------------------------------
+# 5. SCRAPING ETIQUETTE  (component 1: ethical + auditable)
+# --------------------------------------------------------------------------
+USER_AGENT = (
+    "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; "
+    "non-commercial statistical research; contact: diid-pushpak@example.gov.in)"
+)
+REQUEST_TIMEOUT_SECONDS = 20.0
+MAX_RETRIES = 2
+RESPECT_ROBOTS = True          # hard gate; see collect/robots.py. Do not flip.
+DEFAULT_CRAWL_DELAY = 6.0      # used when robots.txt declares no Crawl-delay
+MAX_REQUESTS_PER_SOURCE_PER_RUN = 40
+COLLECT_PII = False            # asserted in tests; the schema has no PII fields
+
+
+@dataclass
+class Settings:
+    """Runtime knobs, overridable from the CLI."""
+    db_path: Path = field(default_factory=lambda: DB_PATH)
+    audit_log_path: Path = field(default_factory=lambda: AUDIT_LOG_PATH)
+    seed: int = 20260826
+
+    def __post_init__(self) -> None:
+        self.db_path = Path(self.db_path)
+        self.audit_log_path = Path(self.audit_log_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)

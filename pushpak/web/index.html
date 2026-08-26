@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Pushpak · Operations Dashboard</title>
+<link rel="stylesheet" href="/static/style.css" />
+<script>
+  // Stamp before first paint so a chosen theme never flashes. Light is the
+  // default, so an unset preference is stamped light explicitly rather than
+  // left to prefers-color-scheme, which would follow a dark-mode OS.
+  (function () {
+    var t = "light";
+    try { t = localStorage.getItem("pushpak-theme") === "dark" ? "dark" : "light"; } catch (e) {}
+    document.documentElement.setAttribute("data-theme", t);
+  })();
+</script>
+</head>
+<body>
+<div class="wrap">
+
+  <header class="top">
+    <div>
+      <div class="brand">Pushpak<span> Index</span></div>
+      <div class="sub">MoSPI Data Informatics &amp; Innovation Division — prototype operations dashboard</div>
+    </div>
+    <nav class="top-links">
+      <a href="/docs">API docs</a>
+      <a href="/api/v1/methodology">Methodology</a>
+      <a href="/api/v1/provenance">Provenance</a>
+      <button type="button" id="theme-toggle" class="theme-toggle"
+              aria-label="Switch theme" title="Switch theme"></button>
+    </nav>
+  </header>
+
+  <!-- Provenance stays visible because the brief requires it, but as a compact
+       factual strip rather than a warning paragraph. It reports whatever is
+       actually true of the data underneath, and changes when that changes. -->
+  <div class="provbar" id="provbar"><span class="kbd">Loading provenance…</span></div>
+
+  <!-- ============ headline tiles ============ -->
+  <section class="grid g4" id="tiles"></section>
+
+  <!-- ============ 1. index trend ============ -->
+  <section class="card" style="margin-top:16px">
+    <h2>Pushpak Index trend</h2>
+    <p class="hint">Fixed-basket Laspeyres index, base = 100 over the first three collection days. Shaded band marks days whose quotes were wholly synthetic.</p>
+    <div class="controls">
+      <button class="seg" data-freq="daily"   aria-pressed="true">Daily</button>
+      <button class="seg" data-freq="weekly"  aria-pressed="false">Weekly</button>
+      <button class="seg" data-freq="monthly" aria-pressed="false">Monthly</button>
+    </div>
+    <div id="trend"></div>
+    <div class="legend">
+      <span><i style="background:var(--s1)"></i>Pushpak Index</span>
+      <span><i style="background:var(--grid)"></i>Synthetic-data period</span>
+      <span><i style="background:var(--axis)"></i>Base = 100</span>
+    </div>
+  </section>
+
+  <!-- ============ 2. route heatmap ============ -->
+  <section class="card" style="margin-top:16px">
+    <h2>Route heatmap</h2>
+    <p class="hint">One row per basket route. Sequential single-hue ramp: darker = higher.</p>
+    <div class="controls">
+      <button class="seg" data-metric="index"      aria-pressed="true">Index level</button>
+      <button class="seg" data-metric="fare"       aria-pressed="false">Mean fare (₹)</button>
+      <button class="seg" data-metric="volatility" aria-pressed="false">Volatility</button>
+    </div>
+    <div class="scrollx"><div id="heatmap"></div></div>
+    <div class="legend" id="heat-legend"></div>
+  </section>
+
+  <div class="grid g2" style="margin-top:16px">
+    <!-- ============ 3. lead-time elasticity ============ -->
+    <section class="card">
+      <h2>Lead-time elasticity</h2>
+      <p class="hint">Mean fare against days to departure. Band shows the 10th–90th percentile across collection days.</p>
+      <div class="controls">
+        <select id="route-select" aria-label="Route"></select>
+      </div>
+      <div id="leadtime"></div>
+      <div id="elasticity" class="sub" style="margin-top:8px"></div>
+    </section>
+
+    <!-- ============ 4. validation back-test ============ -->
+    <section class="card">
+      <h2>Back-test vs benchmark</h2>
+      <p class="hint" id="bt-hint">Loading…</p>
+      <div id="backtest"></div>
+      <div class="legend">
+        <span><i style="background:var(--s1)"></i>Pushpak Index</span>
+        <span><i style="background:var(--s2)"></i>Benchmark</span>
+      </div>
+      <div id="bt-metrics" style="margin-top:12px"></div>
+    </section>
+  </div>
+
+  <!-- ============ 5. collection console ============ -->
+  <section class="card" style="margin-top:16px">
+    <h2>Collection</h2>
+    <p class="hint">Run a collection here and watch what each source returns. Live runs are gated on robots.txt before any socket opens.</p>
+    <div class="controls">
+      <button class="run" data-mode="live">Run live scrape</button>
+      <button class="run" data-mode="api">Run licensed API</button>
+      <button class="run" data-mode="hybrid">Run hybrid</button>
+      <button class="run" data-mode="live" data-dry="1">Dry run</button>
+      <span id="job-state" class="kbd"></span>
+    </div>
+    <div id="job-result"></div>
+    <div class="scrollx" style="margin-top:16px"><div id="sources"></div></div>
+  </section>
+
+  <!-- ============ 6. derived statistics ============ -->
+  <section class="card" style="margin-top:16px">
+    <h2>Statistics</h2>
+    <p class="hint">Rates of change, volatility and breadth. Figures that cannot be computed from a short series are shown as unavailable rather than approximated.</p>
+    <div id="stat-tiles" class="grid g4" style="margin-bottom:18px"></div>
+    <div class="grid g2">
+      <div>
+        <h3 style="font-size:13px;margin:0 0 2px">Route attribution</h3>
+        <p class="hint">Contribution to the latest daily move, in index points. Contributions sum to the total change exactly.</p>
+        <div id="attribution"></div>
+      </div>
+      <div>
+        <h3 style="font-size:13px;margin:0 0 2px">Fare dispersion</h3>
+        <p class="hint">Spread across routes within each advance-purchase window. A monthly average conceals this.</p>
+        <div id="dispersion"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ 7. official CPI context ============ -->
+  <section class="card" style="margin-top:16px">
+    <h2>Official CPI context</h2>
+    <p class="hint" id="cpi-hint">Loading…</p>
+    <div class="grid g2">
+      <div>
+        <div id="cpi-chart"></div>
+        <div class="legend">
+          <span><i style="background:var(--s2)"></i>CPI General Index (All Groups)</span>
+        </div>
+      </div>
+      <div>
+        <div id="freq-gap"></div>
+        <h3 style="font-size:13px;margin:18px 0 2px">Highest state inflation</h3>
+        <div id="statewise"></div>
+      </div>
+    </div>
+    <div class="banner" id="cpi-caveat" style="margin:18px 0 0"></div>
+  </section>
+
+  <!-- ============ 8. audit ledger ============ -->
+  <section class="card" style="margin-top:16px">
+    <h2>Scraping audit ledger</h2>
+    <p class="hint">Every outbound request, including the ones the robots.txt gate refused to issue.</p>
+    <div id="audit"></div>
+  </section>
+
+  <!-- ============ 9. hand reconstruction ============ -->
+  <section class="card" style="margin-top:16px">
+    <h2>Reconstruct the latest index by hand</h2>
+    <p class="hint">Each cell's contribution = weight × (price ÷ base price) × 100. The contributions sum to the published number.</p>
+    <div class="scrollx" id="explain"></div>
+  </section>
+
+  <p class="foot">
+    Pushpak is a hackathon prototype, not an official statistic. Route weights are derived from
+    the DGCA domestic city-pair passenger release; advance-purchase weights are a documented
+    assumption. Fare quotes in this deployment are predominantly synthetic and labelled as such
+    at row level. See <a href="/api/v1/methodology">/api/v1/methodology</a> and
+    <a href="/api/v1/provenance">/api/v1/provenance</a>.
+  </p>
+</div>
+
+<div class="tt" id="tt"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

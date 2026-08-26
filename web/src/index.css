@@ -1,0 +1,170 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ---------------------------------------------------------------------
+   Theme tokens.
+
+   Channels are stored as space-separated RGB triplets so Tailwind can apply
+   opacity modifiers (bg-accent/10, border-hair/60) through
+   `rgb(var(--c-x) / <alpha-value>)`. A resolved `--x` companion is defined for
+   places that need a plain colour, such as SVG stroke and fill attributes.
+
+   Light is the default: bare :root is the light palette, and dark applies only
+   when the reader explicitly selects it. The pre-paint script in index.html
+   stamps data-theme before first paint so a chosen theme never flashes.
+
+   Status colours (good / warning / bad) are fixed and never themed, so a
+   status can never impersonate a themed surface.
+   --------------------------------------------------------------------- */
+@layer base {
+  :root {
+    color-scheme: light;
+
+    --c-plane: 249 249 247;
+    --c-surface: 252 252 251;
+    --c-raised: 240 239 236;
+    --c-hair: 225 224 217;
+    --c-ink: 11 11 11;
+    --c-ink2: 82 81 78;
+    /* Light-mode values are chosen for WCAG AA against the light plane, not
+       copied from the dark palette. On #f9f9f7 the dark-mode muted (#898781)
+       measures 3.41:1 and the dark-mode amber measures 1.79:1, both of which
+       fail for the small informational text they carry here. */
+    --c-muted: 111 110 105;        /* #6f6e69  4.85:1 */
+    --c-accent: 37 106 191;        /* #256abf  5.12:1, white on it 5.39:1 */
+    --c-accent-soft: 28 92 171;    /* #1c5cab  6.29:1 */
+
+    --c-good: 10 125 10;           /* #0a7d0a  5.04:1 */
+    --c-warn: 138 90 0;            /* #8a5a00  5.62:1 */
+    --c-bad: 194 47 47;            /* #c22f2f  5.32:1 */
+
+    --grain-opacity: 0.030;
+    --glow-opacity: 0.10;
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+
+    --c-plane: 13 13 13;
+    --c-surface: 26 26 25;
+    --c-raised: 34 34 33;
+    --c-hair: 44 44 42;
+    --c-ink: 247 247 245;
+    --c-ink2: 195 194 183;
+    --c-muted: 137 135 129;        /* #898781, ample on the near-black plane */
+    --c-accent: 57 135 229;        /* #3987e5, the validated dark-surface step */
+    --c-accent-soft: 42 120 214;
+
+    /* Status colours brighten on the dark plane, where the light-mode dark
+       steps would disappear. */
+    --c-good: 12 163 12;
+    --c-warn: 250 178 25;
+    --c-bad: 230 103 103;          /* #e66767; #d03b3b measures 4.05:1 here */
+
+    --grain-opacity: 0.022;
+    --glow-opacity: 0.12;
+  }
+
+  /* Resolved companions, for SVG attributes and anything that cannot take a
+     Tailwind class. */
+  :root,
+  :root[data-theme="dark"] {
+    --plane: rgb(var(--c-plane));
+    --surface: rgb(var(--c-surface));
+    --raised: rgb(var(--c-raised));
+    --hair: rgb(var(--c-hair));
+    --ink: rgb(var(--c-ink));
+    --ink2: rgb(var(--c-ink2));
+    --muted: rgb(var(--c-muted));
+    --accent: rgb(var(--c-accent));
+    --good: rgb(var(--c-good));
+    --warn: rgb(var(--c-warn));
+    --bad: rgb(var(--c-bad));
+  }
+
+  html {
+    scroll-behavior: smooth;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+  }
+  body {
+    @apply bg-plane text-ink2 font-sans;
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }
+  ::selection {
+    background: var(--accent);
+    color: #fff;
+  }
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 4px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@layer components {
+  .shell {
+    @apply mx-auto w-full max-w-shell px-5 sm:px-8;
+  }
+  /* One radius system for the whole page: 12px surfaces, full-pill controls. */
+  .panel {
+    @apply rounded-xl border border-hair bg-surface;
+  }
+  .rule {
+    @apply h-px w-full bg-hair;
+  }
+  .kbd {
+    @apply font-mono text-[12px] text-muted;
+  }
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 whitespace-nowrap rounded-full
+           px-5 py-2.5 text-sm font-semibold transition
+           active:translate-y-px;
+  }
+  .btn-primary {
+    @apply btn bg-accent text-white hover:bg-accentSoft;
+  }
+  .btn-ghost {
+    @apply btn border border-hair text-ink hover:border-muted hover:bg-raised;
+  }
+  /* Theme toggle: a single control, labelled for screen readers. */
+  .theme-toggle {
+    @apply grid h-9 w-9 place-items-center rounded-full border border-hair
+           text-ink2 transition hover:border-muted hover:text-ink;
+  }
+}
+
+@layer utilities {
+  .will-rise {
+    opacity: 0;
+    transform: translateY(22px);
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .will-rise {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .grain::after {
+    content: "";
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    pointer-events: none;
+    opacity: var(--grain-opacity);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+}

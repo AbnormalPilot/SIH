@@ -1,0 +1,20 @@
+# systemd unit for the built-in scheduler, as an alternative to cron.
+#   sudo cp deploy/pushpak-scheduler.service /etc/systemd/system/
+#   sudo systemctl enable --now pushpak-scheduler
+[Unit]
+Description=Pushpak Index scheduled collection and indexing
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pushpak
+WorkingDirectory=/opt/pushpak
+Environment=PUSHPAK_DB=/var/lib/pushpak/pushpak.db
+Environment=PUSHPAK_AUDIT_LOG=/var/lib/pushpak/scrape_audit.jsonl
+ExecStart=/usr/bin/python3 -m pushpak.cli schedule
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

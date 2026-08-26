@@ -1,0 +1,27 @@
+# Pushpak Index production crontab.
+#
+# Install with:   crontab deploy/pushpak.crontab
+# Inspect with:   crontab -l
+#
+# This is the alternative to the built-in scheduler daemon
+# (`python3 -m pushpak.cli schedule`). Use one or the other, not both: the jobs
+# are idempotent per run_date, so a double-up is safe, but two schedulers
+# writing the same database is needless.
+#
+# Adjust PUSHPAK_HOME to the checkout path.
+
+PUSHPAK_HOME=/opt/pushpak
+PATH=/usr/local/bin:/usr/bin:/bin
+SHELL=/bin/bash
+
+# Collect fare quotes for today, before the day's movements.
+0 2 * * *   cd $PUSHPAK_HOME && python3 -m pushpak.cli collect --mode hybrid >> /var/log/pushpak/collect.log 2>&1
+
+# Recompute and store the index.
+30 2 * * *  cd $PUSHPAK_HOME && python3 -m pushpak.cli index >> /var/log/pushpak/index.log 2>&1
+
+# Sites change robots.txt. Re-check weekly so the compliance claim stays true.
+0 3 * * 1   cd $PUSHPAK_HOME && python3 -m pushpak.cli robots-audit >> /var/log/pushpak/robots.log 2>&1
+
+# Re-derive route weights when a new DGCA release is dropped into data/.
+0 4 1 * *   cd $PUSHPAK_HOME && python3 scripts/build_weights.py >> /var/log/pushpak/weights.log 2>&1

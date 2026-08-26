@@ -1,0 +1,67 @@
+# Pushpak Index — full prototype in two containers.
+#
+#   docker compose up --build
+#     landing page      http://localhost:8080
+#     ops dashboard     http://localhost:8080/dashboard   (or :8000/dashboard)
+#     API docs          http://localhost:8080/docs
+#
+# The api service seeds a labelled synthetic history at build time, so the
+# stack is demoable immediately with no manual steps.
+
+services:
+  api:
+    build: .
+    image: pushpak-api
+    container_name: pushpak-api
+    environment:
+      PUSHPAK_DB: /data/pushpak.db
+      PUSHPAK_AUDIT_LOG: /data/scrape_audit.jsonl
+    volumes:
+      - pushpak-data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  # Unattended daily collection and indexing. Shares the api service's image
+  # and its data volume; the jobs are idempotent per run_date so a restart
+  # cannot double-collect.
+  cron:
+    build: .
+    image: pushpak-api
+    container_name: pushpak-cron
+    command: ["python", "-m", "pushpak.cli", "schedule"]
+    environment:
+      PUSHPAK_DB: /data/pushpak.db
+      PUSHPAK_AUDIT_LOG: /data/scrape_audit.jsonl
+      TZ: Asia/Kolkata
+    volumes:
+      - pushpak-data:/data
+    depends_on:
+      api:
+        condition: service_healthy
+    # The image's default healthcheck probes uvicorn, which this service does
+    # not run, so it would fail forever. Replace it with one that actually
+    # means something here: the scheduler can reach its database. That catches
+    # a bad volume mount or permissions, which would otherwise show up only as
+    # silently missing collection days.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import pushpak.scheduler as s; s.recent(1); print('ok')"]
+      interval: 60s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    image: pushpak-web
+    container_name: pushpak-web
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  pushpak-data:

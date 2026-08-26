@@ -1,0 +1,10 @@
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+.git
+data/pushpak.db
+data/pushpak.db-wal
+data/pushpak.db-shm
+data/scrape_audit.jsonl
+web/node_modules

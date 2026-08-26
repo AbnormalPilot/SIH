@@ -1,0 +1,193 @@
+/* Pushpak Index operational dashboard.
+   Palette: validated dataviz reference instance (see README, Dashboard).
+   Series colours are assigned by entity in fixed slot order, never cycled. */
+:root {
+  color-scheme: light;
+  --surface-1: #fcfcfb;
+  --plane: #f9f9f7;
+  --ink: #0b0b0b;
+  --ink-2: #52514e;
+  --muted: #6f6e69;   /* darkened from #898781 for AA on light */
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+
+  --s1: #2a78d6;  /* Pushpak Index */
+  --s2: #eb6834;  /* benchmark */
+  --s3: #1baf7a;
+  --s4: #eda100;
+  --s5: #e87ba4;
+
+  /* Mark colours: used for dots, fills and chart marks, where 3:1 is the bar. */
+  --good: #0ca30c;
+  --warning: #fab219;
+  --serious: #ec835a;
+  --critical: #d03b3b;
+  /* Text-safe counterparts. The mark colours measure 3.27:1, 1.79:1 and
+     2.57:1 on this surface, which fails for the pill labels that carry them.
+     Marks keep their hue; text gets a darker step of the same hue. */
+  --good-text: #0a7d0a;
+  --warning-text: #8a5a00;
+  --serious-text: #a04a1e;
+  --critical-text: #c22f2f;
+
+  --seq-100: #cde2fb; --seq-250: #86b6ef; --seq-400: #3987e5;
+  --seq-500: #256abf; --seq-600: #184f95; --seq-700: #0d366b;
+}
+/* The page stamps data-theme before first paint and light is the default, so
+   this block only matters for a viewer whose stamp failed to apply (storage
+   blocked, script stripped). It stays guarded so an explicit light choice
+   still wins. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]):not([data-theme="dark"]) {
+    color-scheme: dark;
+    --surface-1: #1a1a19; --plane: #0d0d0d; --ink: #fff; --ink-2: #c3c2b7;
+    --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+    --border: rgba(255, 255, 255, 0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+    --good-text: #0ca30c;
+    --warning-text: #fab219;
+    --serious-text: #ec835a;
+    --critical-text: #e66767;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19; --plane: #0d0d0d; --ink: #fff; --ink-2: #c3c2b7;
+  --muted: #898781; --grid: #2c2c2a; --axis: #383835;
+  --border: rgba(255, 255, 255, 0.10);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181;
+  --good-text: #0ca30c;
+  --warning-text: #fab219;
+  --serious-text: #ec835a;
+  --critical-text: #e66767;
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--plane); color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+a { color: var(--s1); }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 24px 20px 72px; }
+
+header.top {
+  display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline;
+  justify-content: space-between; padding-bottom: 18px;
+  border-bottom: 1px solid var(--border); margin-bottom: 22px;
+}
+.brand { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
+.brand span { color: var(--s1); }
+.sub { color: var(--ink-2); font-size: 13px; margin-top: 2px; }
+.top-links { display: flex; gap: 14px; align-items: center; font-size: 13px; }
+
+/* Theme toggle. One control, one job. */
+.theme-toggle {
+  display: grid; place-items: center; width: 30px; height: 30px;
+  border-radius: 50%; border: 1px solid var(--border);
+  background: var(--surface-1); color: var(--ink-2);
+  cursor: pointer; font-size: 14px; line-height: 1; padding: 0;
+  transition: border-color .15s, color .15s;
+}
+.theme-toggle:hover { border-color: var(--muted); color: var(--ink); }
+.theme-toggle:active { transform: translateY(1px); }
+
+body { transition: background-color .25s ease, color .25s ease; }
+
+/* ---- provenance strip: compact, factual, always present ---- */
+.provbar {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+  margin-bottom: 22px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--surface-1);
+  font-size: 12.5px; color: var(--ink-2);
+}
+.provbar .sep { color: var(--muted); }
+.provbar a { color: var(--muted); text-decoration: none; margin-left: auto; }
+.provbar a:hover { color: var(--s1); }
+
+button.run {
+  font: inherit; font-size: 13px; font-weight: 600; padding: 6px 13px;
+  border-radius: 999px; border: 1px solid var(--border);
+  background: var(--surface-1); color: var(--ink); cursor: pointer;
+  transition: background .15s, border-color .15s;
+}
+button.run:hover:not(:disabled) { border-color: var(--s1); background: var(--raised, transparent); }
+button.run:active:not(:disabled) { transform: translateY(1px); }
+button.run:disabled { opacity: .45; cursor: not-allowed; }
+button.run[data-dry] { color: var(--ink-2); }
+
+/* ---- legacy banner, still used by the CPI caveat ---- */
+.banner {
+  display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px;
+  border: 1px solid var(--border); border-left: 3px solid var(--warning);
+  border-radius: 8px; background: var(--surface-1); margin-bottom: 22px;
+  font-size: 13.5px; color: var(--ink-2);
+}
+.banner strong { color: var(--ink); }
+.banner .ico { flex: none; font-size: 15px; line-height: 1.4; }
+
+.grid { display: grid; gap: 16px; }
+.g4 { grid-template-columns: repeat(4, 1fr); }
+.g2 { grid-template-columns: 1fr 1fr; }
+@media (max-width: 900px) { .g4, .g2 { grid-template-columns: 1fr; } }
+
+.card {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 10px; padding: 16px 18px;
+}
+.card h2 {
+  margin: 0 0 2px; font-size: 14px; font-weight: 620; letter-spacing: -0.005em;
+}
+.card .hint { margin: 0 0 14px; font-size: 12.5px; color: var(--muted); }
+
+.tile .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+.tile .value { font-size: 30px; font-weight: 640; letter-spacing: -0.02em; margin-top: 6px; }
+.tile .meta { font-size: 12.5px; color: var(--ink-2); margin-top: 4px; }
+.up { color: var(--critical-text); } .down { color: var(--good-text); }
+
+.pill {
+  display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px;
+  font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border);
+}
+.pill.green  { color: var(--good-text); }
+.pill.amber  { color: var(--serious-text); }
+.pill.red    { color: var(--critical-text); }
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 14px; }
+select, button.seg {
+  font: inherit; font-size: 13px; padding: 5px 10px; border-radius: 7px;
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--ink);
+  cursor: pointer;
+}
+button.seg[aria-pressed="true"] { background: var(--s1); color: #fff; border-color: transparent; }
+
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+.axis text { font-size: 11px; fill: var(--muted); }
+.axis line, .axis path { stroke: var(--axis); }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12.5px; color: var(--ink-2); margin-top: 10px; }
+.legend i { width: 11px; height: 11px; border-radius: 3px; display: inline-block; margin-right: 6px; vertical-align: -1px; }
+
+.tt {
+  position: fixed; pointer-events: none; opacity: 0; transition: opacity .1s;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+  padding: 9px 11px; font-size: 12.5px; color: var(--ink); z-index: 50;
+  box-shadow: 0 6px 22px rgba(0,0,0,.13); max-width: 280px;
+}
+.tt b { display: block; margin-bottom: 4px; font-size: 12px; color: var(--ink-2); font-weight: 600; }
+.tt .row { display: flex; justify-content: space-between; gap: 14px; }
+.tt .row span:last-child { font-variant-numeric: tabular-nums; }
+
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--border); }
+th { font-size: 11.5px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); font-weight: 600; }
+td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+tbody tr:hover { background: color-mix(in oklab, var(--s1) 6%, transparent); }
+
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+.scrollx { overflow-x: auto; }
+.foot { margin-top: 30px; font-size: 12.5px; color: var(--muted); line-height: 1.7; }
+.err { color: var(--critical-text); font-size: 13px; }
