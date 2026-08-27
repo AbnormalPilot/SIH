@@ -3,8 +3,10 @@
 **/__pycache__
 **/*.pyc
 .git
+data/scrape_audit.jsonl
+web/node_modules
+# Pre-Postgres SQLite artefact. The project no longer writes this, but an
+# 85 MB file from before the migration may still be sitting in data/.
 data/pushpak.db
 data/pushpak.db-wal
 data/pushpak.db-shm
-data/scrape_audit.jsonl
-web/node_modules
