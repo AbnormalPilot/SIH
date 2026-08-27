@@ -22,10 +22,18 @@ scrape  →  normalise  →  impute  →  index  →  dashboard + API  →  back
 
 ```bash
 # Docker: the whole thing, seeded and ready
+cp .env.example .env      # set POSTGRES_PASSWORD — compose refuses to start without it
 docker compose up --build
-#   landing page    http://localhost:8080
-#   dashboard       http://localhost:8080/dashboard
-#   API docs        http://localhost:8080/docs
+#   landing page    http://localhost:8000
+#   dashboard       http://localhost:8000/dashboard
+#   API docs        http://localhost:8000/docs
+
+# One command, no Docker: starts a local Postgres, builds the landing page,
+# runs every stage, then serves the whole prototype on a single origin.
+make demo
+#   landing page    http://127.0.0.1:8000
+#   dashboard       http://127.0.0.1:8000/dashboard
+#   API docs        http://127.0.0.1:8000/docs
 
 # Development: API with reload + landing dev server, together
 make install
@@ -45,13 +53,69 @@ python3 -m pushpak.cli stats             # 3. inflation, volatility, attribution
 python3 -m pushpak.cli cpi               # 6. official CPI context
 python3 -m pushpak.cli validate          # 6. back-test
 python3 -m pushpak.cli serve             # 4 + 5. dashboard and API on :8000
-python3 -m pytest                     # 8. 116 tests
+python3 -m pytest                     # 8. 136 tests
 ```
 
 `make help` lists every target with the component number it satisfies.
-`make dev` seeds the database on first run so nothing is empty.
+`make demo` and `make dev` both run `make db` first, which starts a local
+Postgres in `~/.pushpak-pg` on port 5433 if `PUSHPAK_DB_URL` is not already
+reachable. `make db-stop` stops it; `make clean` drops every Pushpak table.
+
+`PUSHPAK_DB_URL` defaults to `postgresql://pushpak:pushpak@localhost:5432/pushpak`.
+The test suite uses the same variable and **drops the tables in it**, so point it
+at a throwaway database before running `make test`.
 
 ---
+
+---
+
+## Deployment (VPS / Dokploy)
+
+One image, three services, one HTTP entrypoint. FastAPI serves the landing
+page, the dashboard, the API and the OpenAPI docs from a single origin, so
+there is no second web tier to route around and only one port to attach a
+domain to.
+
+```
+db    postgres:16-alpine, named volume, healthchecked
+api   the image below, port 8000   <- attach your domain here
+cron  same image, runs the scheduler, never serves HTTP
+```
+
+### Dokploy
+
+1. Create a Compose application pointing at this repository's
+   `docker-compose.yml`.
+2. In **Environment**, set the variables from `.env.example`. `POSTGRES_PASSWORD`
+   is required — compose is written to fail rather than start a public database
+   with a default password.
+3. Attach your domain to the **api** service on port **8000**.
+4. Deploy. The entrypoint creates the schema, and seeds 30 days of labelled
+   synthetic history only if the database is empty, so a redeploy does not
+   repeat 216k rows of work.
+
+Once Traefik fronts the app you can drop the `ports:` block from the `api`
+service — publishing 8000 also exposes it on the VPS IP, bypassing TLS.
+
+### What is deliberately not in the image
+
+- **No connection string.** `PUSHPAK_DB_URL` is supplied at run time. Baking a
+  password into an image is how credentials reach a registry.
+- **No tests**, and no `data/pushpak.db` — the 81 MB SQLite file from before the
+  Postgres migration is ignored by both git and Docker.
+
+### Operational notes
+
+- **Persistence** lives in two named volumes: `pushpak-pgdata` (the database)
+  and `pushpak-data` (the JSONL audit log). Back up the first.
+- **`TRAVELPAYOUTS_TOKEN`** is optional. Without it collection falls back to
+  labelled synthetic data and every index value says so through
+  `synthetic_share`; nothing silently pretends to be real.
+- **CORS is `*` for GET only.** This is a public read-only statistics API; it
+  holds no credentials and sets no cookies.
+- **`PUSHPAK_SEED_ON_START=0`** for a deployment that should only ever contain
+  collected data.
+
 
 ## The eight components, and where they live
 
@@ -73,15 +137,16 @@ demonstrates every stage.
 
 ## 1. Architecture, and why
 
-**Python 3.13 + FastAPI + SQLite + pandas, with a React landing page.**
+**Python 3.13 + FastAPI + Postgres + pandas, with a React landing page.**
 
 | Choice | Why |
 |---|---|
-| **SQLite** | A reviewer can open `data/pushpak.db` with the `sqlite3` CLI and audit every row without provisioning anything. Auditability was the requirement; a Postgres cluster would have worked against it. |
+| **Postgres** | Auditability was the requirement, and it survives the move: every row is still readable with one `psql` session, and `docker compose up` provisions the server so a reviewer still runs no setup by hand. What a single file could not give us is concurrent writers — the scheduler collects while the API reads — plus real types, `TRUNCATE`/`CASCADE` and a migration path off a laptop. |
 | **FastAPI** | `/docs` gives interactive OpenAPI documentation for free, so "documented API" is a property of the code rather than a promise in a README. |
 | **pandas** | The index is a weighted sum over a few hundred cells. This is not a big-data problem and pretending otherwise would have cost the whole build. |
 | **Hand-rolled SVG dashboard** | No CDN, no build step, no network. A demo booth with bad wifi still renders the charts, and every line that draws a number is readable. |
 | **React + Vite + GSAP landing** | The landing page is a separate concern from the operations dashboard and is built from the provided starter, retargeted to Pushpak. |
+| **One origin, no nginx locally** | In Docker, nginx serves `web/dist` and proxies the rest. Locally there is no nginx: FastAPI serves the built landing page at `/` and the assets at `/assets`, so the landing page, dashboard, API and docs are all on `:8000` and the browser needs no CORS. A checkout with no node build still works — `/` falls back to the dashboard. |
 | **One dependency set** | `requirements.txt` is seven packages. Nothing here needs a queue, a broker or a warehouse yet. |
 
 Data flows in one direction and every stage is a separate module with its own
@@ -98,7 +163,7 @@ Pushpak(t) = 100 × Σ over cells c of [ w(c) × P(c,t) / P(c,0) ]
 ```
 
 A **cell** is one (route × advance-purchase window). With 5 routes and 4
-windows there are 20 cells.
+windows there are 60 cells.
 
 - **P(c,t)** is the arithmetic mean of the priced quotes in that cell on day *t*.
 - **P(c,0)** is the base-period price: the mean of that cell's daily prices over
@@ -115,19 +180,18 @@ each cell's price relative by its weight, add them up, multiply by 100.
 This is not a claim, it is a command:
 
 ```
-$ python3 -m pushpak.cli explain --date 2026-08-25
+$ python3 -m pushpak.cli explain --date 2026-08-26
 
 cell                       base    price      rel    weight   contrib  flags
-----------------------------------------------------------------------------
-BOM-DEL @ T+15             5945     5623   0.9457    0.0870    8.2323  SYN:100%,soldout:4
-BOM-DEL @ T+7              7811     6741   0.8630    0.0933    8.0487  SYN:100%,soldout:16
-BLR-BOM @ T+15             4946     6402   1.2943    0.0530    6.8605  SYN:100%,soldout:4
-...                          16 further cells ...
-----------------------------------------------------------------------------
-SUM                                                  1.0000   97.1822
-PUBLISHED                                                     97.1822
-
-reconciles exactly: True  (residual -1.42e-14)
+----------------------------------------------------------------------------------------
+BOM-DEL @ T+7              7711     6847   0.8879    0.0459    4.0741  SYN:100%,soldout:11
+BOM-DEL @ T+15             6301     5212   0.8272    0.0428    3.5425  SYN:100%,soldout:7
+BOM-DEL @ T+1              9186    10149   1.1048    0.0306    3.3795  SYN:100%,soldout:34
+...                          57 further cells ...
+----------------------------------------------------------------------------------------
+SUM                                                  1.0000   97.8306
+PUBLISHED                                                     97.8306
+reconciles exactly: True  (residual 1.42e-14)
 ```
 
 The same decomposition is available at `/api/v1/index/explain`.
@@ -140,17 +204,27 @@ The same decomposition is available at `/api/v1/index/explain`.
 `data/route_weights.csv`. A test regenerates the file and asserts it matches
 what is committed.
 
-The basket is the top 5 city pairs by passengers over the most recent 12 months
+The basket is the top 15 city pairs by passengers over the most recent 12 months
 in that file (2025-06 to 2026-05):
 
 | Route | Passengers, 12 months | Basket weight | Share of all domestic passengers |
 |---|---:|---:|---:|
-| BOM-DEL | 6,743,036 | 31.09% | 4.01% |
-| BLR-DEL | 4,879,073 | 22.49% | 2.90% |
-| BLR-BOM | 4,106,189 | 18.93% | 2.44% |
-| DEL-HYD | 3,095,780 | 14.27% | 1.84% |
-| CCU-DEL | 2,866,361 | 13.21% | 1.70% |
-| **Total** | **21,690,439** | **100%** | **12.89%** |
+| BOM-DEL | 6,743,036 | 15.29% | 4.01% |
+| BLR-DEL | 4,879,073 | 11.07% | 2.90% |
+| BLR-BOM | 4,106,189 | 9.31% | 2.44% |
+| DEL-HYD | 3,095,780 | 7.02% | 1.84% |
+| CCU-DEL | 2,866,361 | 6.50% | 1.70% |
+| DEL-PNQ | 2,864,333 | 6.50% | 1.70% |
+| AMD-DEL | 2,371,349 | 5.38% | 1.41% |
+| BOM-CCU | 2,278,047 | 5.17% | 1.35% |
+| BLR-HYD | 2,251,473 | 5.11% | 1.34% |
+| DEL-MAA | 2,221,545 | 5.04% | 1.32% |
+| BOM-MAA | 2,210,575 | 5.01% | 1.31% |
+| BOM-HYD | 2,209,747 | 5.01% | 1.31% |
+| BLR-CCU | 2,171,615 | 4.93% | 1.29% |
+| AMD-BOM | 2,020,809 | 4.58% | 1.20% |
+| DEL-SXR | 1,797,847 | 4.08% | 1.07% |
+| **Total** | **44,087,779** | **100%** | **26.20%** |
 
 Two normalisation steps matter here and are easy to get wrong:
 
@@ -210,9 +284,37 @@ So sold-out quotes are retained as unpriced observations, counted in
 with the reason recorded. The same applies to cancelled flights, failed fetches
 and robots-blocked requests: they are rows with null fares, never absent rows.
 
+### Both elementary aggregates are published
+
+The headline is **arithmetic (Dutot)**: a weighted arithmetic mean of price
+relatives. It was chosen because it is the form a reader can check on paper,
+which the brief asked for explicitly — `explain` adds 60 terms and they sum to
+the published number.
+
+A **geometric (Jevons)** aggregate over the *same* weights and the *same*
+relatives is computed and published beside it, at every frequency, as
+`index_value_jevons`:
+
+```
+Jevons(t) = 100 x exp( SUM_c [ w(c) x ln( P(c,t)/P(c,0) ) ] )
+```
+
+Jevons is arguably better behaved for airfares, so the choice is exposed as a
+number rather than settled silently in a footnote. Two properties are pinned by
+tests:
+
+- **They coincide exactly when every cell moves by the same factor.** Move all
+  60 cells up 10% and both read exactly 110. The two can only diverge because
+  of *dispersion* in the relatives.
+- **Jevons is never above Dutot** (AM–GM), with equality only in that uniform
+  case. On the shipped 30-day series it runs about 1 index point lower.
+
+Only the arithmetic form is hand-reconstructable from the `explain` table, and
+`/api/v1/index/explain` says so in its `elementary_aggregate` field.
+
 ### What is deliberately not implemented
 
-Chain-linking, seasonal adjustment, quality adjustment, and geometric (Jevons)
+Chain-linking, seasonal adjustment, quality adjustment, and
 elementary aggregation. The brief asked for a legible prototype. A weighted
 arithmetic mean of price relatives is the form a reader can check on paper; a
 geometric elementary aggregate is arguably better behaved for airfares and is
@@ -238,7 +340,7 @@ noted below as a limitation rather than smuggled in.
 - **No PII.** The schema has no field for it; a test asserts the forbidden
   field names are absent and `COLLECT_PII is False`.
 - **A full audit ledger.** Every request, *including the ones we refused to
-  make*, is written to SQLite and to an append-only JSONL file with source,
+  make*, is written to Postgres and to an append-only JSONL file with source,
   timestamp, URL pattern, the robots rule that applied, the delay waited, and
   the outcome. Visible at `/api/v1/audit` and on the dashboard.
 
@@ -309,16 +411,125 @@ It would not scrape at all, and one of those channels is already wired up.
 | **DGCA Tariff Monitoring Unit** | Government to government | Airlines *already file* fare data with DGCA. An inter-departmental feed is the cheapest and most defensible production path for MoSPI. |
 | **Airline data-sharing MoU** | Commercial agreement | Direct distribution or NDC feeds from IndiGo, Air India and others. |
 | **Skyscanner Partners API** | Partner-only, application required | A closed API; approval is discretionary. |
-| **Amadeus for Developers** | Self-service API key, free tier | **Implemented.** `pushpak/collect/official_api.py` uses Flight Offers Search for real airline content. Set `AMADEUS_CLIENT_ID` and `AMADEUS_CLIENT_SECRET`, then `make collect-api`. |
+| **Amadeus for Developers** | ~~Self-service API key~~ **WITHDRAWN 17 Jul 2026** | Pushpak originally collected here. Amadeus decommissioned the self-service portal; `api.amadeus.com` and `test.api.amadeus.com` no longer resolve in DNS. Enterprise is unaffected but needs a contract. Kept on the record in `config.OFFICIAL_DATA_CHANNELS`. |
+| **Travelpayouts / Aviasales Data API** | Self-service token, free | **Implemented and collecting real fares.** `pushpak/collect/official_api.py`, via `/aviasales/v3/prices_for_dates?one_way=true`. Set `TRAVELPAYOUTS_TOKEN`, then `make probe-api` to measure coverage and `make collect-api` to collect. **Measured coverage: 45/60 (75%) on 26 Aug, 38/60 (63%) the next day — it moves.** Serves *cached one-way observations*, not live shopping quotes — see below. |
 
 These are recorded machine-readably in `config.OFFICIAL_DATA_CHANNELS` and
 returned by `/api/v1/provenance`.
 
+### A vendor withdrew our licensed channel mid-build
+
+This is not a hypothetical risk, it happened to this repository.
+
+Pushpak originally collected real fares through the **Amadeus for Developers
+Self-Service** API. On **17 July 2026 Amadeus decommissioned that portal.**
+Not deprecated, not rate-limited — withdrawn. `api.amadeus.com` and
+`test.api.amadeus.com` stopped resolving in DNS:
+
+```
+$ curl -sv https://test.api.amadeus.com/v1/security/oauth2/token
+* Could not resolve host: test.api.amadeus.com
+```
+
+The code kept offering that path, and this README kept saying **"Implemented"**,
+so `make collect-api` could not have succeeded on any machine on earth. We
+found it by checking our own claim rather than by a judge finding it.
+
+Three things changed as a result, and the third is the one that matters:
+
+1. The collector was re-pointed at the **Travelpayouts / Aviasales Data API**
+   (`TRAVELPAYOUTS_TOKEN`), and the class was renamed `OfficialApiCollector`
+   rather than being named after any one vendor.
+2. `tests/test_api.py` now walks every module's endpoint constants and **fails
+   if a live code path names a decommissioned host**, so the next withdrawal
+   surfaces as a red test rather than an empty result.
+3. The withdrawal is kept in `config.OFFICIAL_DATA_CHANNELS` as evidence for a
+   `_vendor_risk` entry, because the incident *is* the argument:
+
+   > **A national statistical product cannot rest on a commercial self-service
+   > API that a vendor can withdraw at will.** Amadeus withdrew self-service in
+   > July 2026; Kiwi.com's Tequila closed self-serve signups the same year;
+   > Skyscanner Partners remains discretionary. The government-to-government
+   > DGCA Tariff Monitoring Unit feed is not merely the *cheapest* production
+   > channel for MoSPI — it is the only one no vendor can switch off.
+
+**What the current channel actually is.** Travelpayouts serves *cached
+cheapest-fare observations aggregated from Aviasales user searches*, not live
+shopping quotes issued against inventory: one observation per route-date rather
+than a distribution. That is a materially different thing from a scraped OTA
+quote, so it is stated in `status()`, in each quote's `notes` field, and here.
+`make probe-api` measures how many of the 60 cells the channel actually covers
+and prints the share. Coverage is measured before it is claimed; thin coverage
+is reported as thin.
+
+### Two more bugs the live API handed us
+
+Neither is in the provider's documentation. Both were found by probing the real
+endpoint, and either would have silently corrupted the index rather than
+failing loudly.
+
+**The date parameter is ignored.** `/v1/prices/calendar` takes a `depart_date`.
+Asked for `2026-09-10` on BOM-DEL it returns sixteen *other* dates, scattered
+from August to the following February — and not the one requested:
+
+```
+asked for 2026-09-10; present in response? False
+dates returned: 2026-08-27, 2026-09-04, 2026-09-17, 2026-09-22, 2026-10-01,
+                2026-10-08, 2026-11-04, ... 2027-02-19
+```
+
+A collector that looks up the requested date gets nothing, ~60 times out of 60,
+and the result looks exactly like a channel with no Indian coverage. We would
+have reported "Travelpayouts does not cover India" and been wrong.
+
+**Those prices are round-trip.** Every row from that endpoint carries a
+`return_at`. Indexing them as one-way fares would have measured a different
+quantity from the one the index claims to measure, with no error anywhere.
+
+So collection uses `/aviasales/v3/prices_for_dates` with `one_way=true`,
+queried by month and filtered to exact travel dates in our own code. Two tests
+pin it: one asserts the request never omits `one_way`, and one feeds the
+collector a T+9 and a T+22 row and asserts they are **dropped rather than
+snapped** into the T+7 and T+30 cells. A fare for T+9 is not evidence about
+T+7, and bucketing it as though it were would quietly corrupt the
+advance-purchase dimension the whole index rests on. Cells with no exact match
+stay empty and go through the imputation ladder, flagged, like any other gap.
+
 ---
 
-## 4. The synthetic fallback, and how it is labelled
+## 4. Real fares, the synthetic fallback, and how both are labelled
 
-Live collection returns no prices, so the demo runs on a synthetic generator.
+**Scraping** returns no prices: of eight sources, two permit crawling and none
+yield route-level fares to a compliant static client. **The licensed API does.**
+With `TRAVELPAYOUTS_TOKEN` set, a run prices 45 of 60 cells from real one-way
+fares and gap-fills the other 15, labelled:
+
+```
+$ make collect        # hybrid: licensed API first, synthetic fills the gaps
+
+  api_quotes                   66        <- real, OFFICIAL_API
+  api_priced                   66
+  live_quotes                 960        <- all unpriced: robots-blocked or no fares
+  synthetic_quotes           1800
+  cells_filled_synthetically   15
+  synthetic_share            0.637
+
+  2026-08-26: 66 quotes from the licensed API, labelled OFFICIAL_API
+  2026-08-26: 15/60 cells had no live price; filled with SYNTHETIC-labelled quotes
+```
+
+Cells never mix provenance. On the run above: **45 cells real-only, 15
+synthetic-only, 0 mixed** — a cell with even one real quote is left alone. The
+`explain` table shows it per term, with a `SYN:` flag only where one applies:
+
+```
+BOM-DEL @ T+7    7711   6011   0.7795   0.0459   3.5766
+BOM-DEL @ T+15   6301   5212   0.8272   0.0428   3.5425  SYN:88%,soldout:7
+```
+
+The first line is a real IndiGo/Air India Express fare. The second is a gap
+fill, and says so.
+
 The brief's rule was: never silently substitute synthetic data. That is enforced
 structurally, not by convention.
 
@@ -348,15 +559,15 @@ stable hash, so re-running reproduces the identical series.
 | Mode | `collection_mode` | What it is |
 |---|---|---|
 | `--mode live` | `LIVE_SCRAPE` | a real HTTP response from a scraped page |
-| `--mode api` | `OFFICIAL_API` | licensed Amadeus content. Not scraping, and not synthetic |
+| `--mode api` | `OFFICIAL_API` | licensed API content. Not scraping, and not synthetic |
 | `--mode synthetic` | `SYNTHETIC` | generated locally |
 | `--mode hybrid` | all three | tries the API and scraping, labels any gap-fill |
 
 The API-key path is the one that produces **real fares without scraping**:
 
 ```bash
-export AMADEUS_CLIENT_ID=...        # free tier at developers.amadeus.com
-export AMADEUS_CLIENT_SECRET=...
+export TRAVELPAYOUTS_TOKEN=...      # free at travelpayouts.com/developers/api
+make probe-api                      # measure coverage BEFORE claiming anything
 make collect-api
 ```
 
@@ -403,6 +614,11 @@ Three properties matter and are implemented rather than left to the operator:
   indistinguishable from a stopped one.
 - **Catch-up on start.** A job whose window was missed while the process was
   down runs on the next tick instead of waiting a day.
+- **Failures back off.** A failed job used to re-run on the very next tick —
+  at `tick_seconds=30` that is ~2,880 attempts a day against third-party hosts,
+  which contradicts the politeness this project claims everywhere else. Retries
+  now wait 5 minutes, then 10, 20, 40 … capped at 4 hours, and the pending wait
+  is returned by `run_due` and printed rather than passing silently.
 
 **Host cron or systemd** are the alternative, for deployments that prefer the
 platform's own scheduler:
@@ -454,18 +670,19 @@ counterpart and flagged `annualised_is_projection: true`, because compounding a
 ```
 $ python3 -m pushpak.cli stats
 
-  day on day %                         -0.4969
-  week on week %                        4.6574
+  day on day %                          4.4457
+  week on week %                        2.8794
   year on year %                   unavailable   (29-day series)
-  annualised % (projection)             7.8765
-  diffusion index                        40.00   (8 up / 12 down of 20)
+  annualised % (projection)            17.7537
+  diffusion index                        68.33   (41 up / 19 down of 60)
 
-  route contributions to a -0.4853 point move:
-    BLR-BOM        -0.6555 pts
-    BLR-DEL        -0.5150 pts
-    BOM-DEL         0.3805 pts
-    DEL-HYD         0.2942 pts
-    CCU-DEL         0.0104 pts
+  route contributions to a +4.1641 point move:
+    DEL-HYD         1.7293 pts
+    BOM-DEL         0.7837 pts
+    BLR-BOM        -0.6300 pts
+    DEL-SXR         0.4651 pts
+    CCU-DEL         0.3911 pts
+    ... 10 further routes ...
 ```
 
 ---
@@ -497,7 +714,7 @@ $ python3 -m pushpak.cli cpi
 
 Frequency gap
   CPI  : 19 observations over 546 days  (All-India general index, monthly)
-  Pushpak Index : 30 observations over 29 days   (5 city pairs x 4 windows, daily)
+  Pushpak Index : 30 observations over 29 days  (15 city pairs x 4 advance-purchase windows, daily)
   Pushpak Index produces ~30x the observations per year.
 ```
 
@@ -534,11 +751,10 @@ $ python3 -m pushpak.cli validate
 
 Back-test vs benchmark   verdict: MACHINERY_ONLY
 benchmark official: False  provenance: ILLUSTRATIVE_PLACEHOLDER
-
-  n_periods                              30
-  correlation                            0.5122
-  mape_percent                           3.8681
-  direction_agreement                    0.5862
+  n_periods                              29
+  correlation                            0.5966
+  mape_percent                           3.0585
+  direction_agreement                    0.6786
 
 NOT A VALIDATION. The benchmark series is a labelled placeholder, not an
 official DGCA fare release, so these metrics demonstrate that the back-test
@@ -639,19 +855,20 @@ colour-vision separation and contrast against both surfaces).
 
 ```
 $ python3 -m pytest
-116 passed
+134 passed
 ```
 
 `pytest.ini` escalates `FutureWarning` and `DeprecationWarning` to errors, so
 the suite fails on deprecated pandas usage rather than accumulating it.
 
-- **`tests/test_index.py`** (17) — base equals exactly 100; a uniform 10% rise
+- **`tests/test_index.py`** (22) — base equals exactly 100; a uniform 10% rise
   gives exactly 110; weighting follows DGCA shares and provably not equal
   shares; advance-purchase weights are applied; the index is invariant to
   rescaling every fare (a price index must not move when units change);
   out-of-basket routes cannot leak in; `explain` reconciles to zero residual;
   weekly resampling averages daily values; wholly synthetic data can never be
-  green.
+  green; Dutot and Jevons agree exactly under a uniform move and Jevons never
+  exceeds Dutot (AM-GM) on any published day.
 - **`tests/test_clean.py`** (25) — schema invariants (sold-out must carry a null
   fare, fare components must reconcile, advance-purchase days must match the
   dates); `collection_mode` has no default; no PII fields; outliers are flagged
@@ -663,6 +880,10 @@ the suite fails on deprecated pandas usage rather than accumulating it.
 - **`tests/test_robots.py`** (15) — the wildcard regression test, longest-match
   and Allow-beats-Disallow, `$` anchors, query-string patterns, group selection,
   fail-closed on unreachable and on 5xx, the crawl-delay floor.
+- **`tests/test_scheduler.py`** (5) — a failed job is *not* retried on the next
+  tick; backoff grows exponentially, is capped, and is reported to the caller
+  rather than passing silently; the wait expires so a job is not blocked for
+  the whole day; a succeeded job is still never re-run.
 - **`tests/test_stats.py`** (13) — a flat series has exactly zero volatility;
   route contributions sum to the total move and to the actual index change;
   when only the heavy route moves it gets 100% of the credit; diffusion tells a
@@ -674,11 +895,14 @@ the suite fails on deprecated pandas usage rather than accumulating it.
   comparison reports `comparable_as_level: false`; no fit statistic appears
   anywhere in the returned structure; `pushpak/validate.py` does not reference the
   CPI module.
-- **`tests/test_api.py`** (23) — every index row carries provenance; synthetic
+- **`tests/test_api.py`** (37) — every index row carries provenance; synthetic
   data is never green; the validation endpoint does not claim validation with a
   placeholder benchmark; sold-out rows are retained by `/api/v1/fares`;
   lead-time elasticity is negative; path traversal on the static handler is
-  rejected.
+  rejected; **no live code path names a decommissioned vendor host**, and a
+  withdrawn channel stays on the record as withdrawn rather than being
+  advertised; the licensed collector never requests round-trip prices, and a
+  T+9 fare is **dropped rather than snapped** into the T+7 cell.
 
 ---
 
@@ -686,35 +910,51 @@ the suite fails on deprecated pandas usage rather than accumulating it.
 
 Stated plainly, because the brief asked for them.
 
-1. **The fare data is synthetic by default.** Of eight sources, two permit
-   crawling and none yield route-level fares to a compliant static client, so
-   out of the box the index measures the pipeline rather than the Indian
-   airfare market. Labelled everywhere, and it is still the largest caveat.
-   Supplying Amadeus credentials replaces it with real `OFFICIAL_API` quotes.
+1. **The history is synthetic; only the latest day carries real fares.** With
+   `TRAVELPAYOUTS_TOKEN` set, a collection run prices **most of the 60 cells
+   from real licensed one-way fares** — 45 (75%) on 26 August, 38 (63%) the
+   next day — and the rest are synthetic-labelled gap fills. **Coverage is not
+   a fixed property of the channel**: it depends on which travel dates the
+   cache holds when you ask, and it moved 12 points overnight, which is why
+   `make probe-api` exists and why no single figure is quoted as *the*
+   coverage. But the licensed channel returns *current*
+   cached fares, not history, so the 29 days behind the latest observation are
+   still generated. **The index is therefore a real-fare snapshot sitting on a
+   synthetic back-series, not yet a real-fare time series.** A genuine series
+   needs the scheduler running daily from here forward — one real day is added
+   per day, and nothing else changes. This remains the largest caveat, and
+   `synthetic_share` reports it per day: 1.00 for the back-series, 0.64 for the
+   collected day.
 2. **The back-test is machinery only.** The benchmark is a placeholder, so no
    claim is made about tracking accuracy.
 3. **Advance-purchase weights are assumed**, not measured. They are the one
    ungrounded input to the index and are tagged `ASSUMED_PRIOR` in code, API and
    this README.
-4. **Five routes, 12.89% of domestic passengers.** A production basket would
-   need considerably wider coverage, and stratification by metro, trunk and
-   regional routes.
+4. **Fifteen routes, 26.20% of domestic passengers.** Doubled from the
+   original five (12.89%), but a production basket would still need wider
+   coverage and stratification by metro, trunk and regional routes. Raising
+   `config.BASKET_SIZE` is the only change required; `build_weights.py` fails
+   loudly on any city missing an IATA mapping, so it cannot silently drop a
+   route.
 5. **Economy class only**, one adult, non-stop preference implied by the
    generator. No premium cabins, no ancillaries, no multi-city.
 6. **Thirty days of history**, generated in one pass. Genuine high-frequency
    behaviour would need real longitudinal collection.
-7. **The elementary aggregate is arithmetic (Dutot).** A geometric (Jevons)
-   aggregate is arguably better behaved for airfares. Arithmetic was chosen for
-   hand-reconstructability, which the brief asked for explicitly.
+7. **The headline elementary aggregate is arithmetic (Dutot)**, chosen for
+   hand-reconstructability. The geometric (Jevons) alternative is now computed
+   and published beside it at every frequency, but only the arithmetic form can
+   be rebuilt by adding the `explain` terms.
 8. **No chain-linking or seasonal adjustment**, so the index will drift from a
    fixed basket over long horizons and will show festival and holiday effects
    as real movement.
 9. **The live parser is generic.** It is unit-tested against fixtures rather
    than tuned to a live DOM we are not permitted to fetch, so it would need real
    work if a source ever became permissible.
-10. **The scheduler has no retry queue or alerting.** Failures are recorded
-    and visible at `/api/v1/schedule`, but nothing pages anyone, and a failed
-    job waits for the next day rather than backing off and retrying.
+10. **The scheduler has no alerting.** Failures are recorded and visible at
+    `/api/v1/schedule`, and a failed job now backs off exponentially
+    (5 min, 10, 20, … capped at 4 h) instead of being retried on every 30-second
+    tick, but nothing pages anyone. There is no dead-letter queue and no
+    escalation past the cap.
 11. **The CPI workbook has no transport sub-group**, so the official context is
     a headline index only. The comparison that would actually matter, Pushpak Index
     against the CPI air-fare component, is not possible with this file.
@@ -729,7 +969,7 @@ Stated plainly, because the brief asked for them.
 pushpak/
   config.py            basket, weights, sources, scraping policy
   schema.py            the one record schema, with validation
-  storage.py           SQLite persistence and the audit tables
+  storage.py           Postgres persistence and the audit tables
   clean.py             normalise, validate, screen, aggregate, impute
   index.py             the Laspeyres index and explain()
   validate.py          the back-test
@@ -743,7 +983,7 @@ pushpak/
     ratelimit.py       per-host minimum interval
     audit.py           append-only request ledger
     live.py            the real scraper
-    official_api.py    licensed fare data (Amadeus), not scraping
+    official_api.py    licensed fare data (Travelpayouts), not scraping
     synthetic.py       the labelled synthetic generator
     runner.py          live / synthetic / hybrid orchestration
   web/                 the operations dashboard
@@ -761,7 +1001,7 @@ deploy/
 scripts/
   build_weights.py                       the only thing that writes weights
   dev.sh                                 `make dev`: API + landing together
-tests/                                   116 tests
+tests/                                   136 tests
 web/                                     React + Vite + GSAP landing page
 ```
 
