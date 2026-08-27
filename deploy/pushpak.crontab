@@ -11,6 +11,7 @@
 # Adjust PUSHPAK_HOME to the checkout path.
 
 PUSHPAK_HOME=/opt/pushpak
+PUSHPAK_DB_URL=postgresql://pushpak:pushpak@localhost:5432/pushpak
 PATH=/usr/local/bin:/usr/bin:/bin
 SHELL=/bin/bash
 

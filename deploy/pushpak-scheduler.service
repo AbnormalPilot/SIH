@@ -3,14 +3,14 @@
 #   sudo systemctl enable --now pushpak-scheduler
 [Unit]
 Description=Pushpak Index scheduled collection and indexing
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 User=pushpak
 WorkingDirectory=/opt/pushpak
-Environment=PUSHPAK_DB=/var/lib/pushpak/pushpak.db
+Environment=PUSHPAK_DB_URL=postgresql://pushpak:pushpak@localhost:5432/pushpak
 Environment=PUSHPAK_AUDIT_LOG=/var/lib/pushpak/scrape_audit.jsonl
 ExecStart=/usr/bin/python3 -m pushpak.cli schedule
 Restart=always

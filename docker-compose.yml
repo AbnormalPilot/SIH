@@ -1,67 +1,89 @@
-# Pushpak Index — full prototype in two containers.
+# Pushpak Index — production stack. Three services, one HTTP entrypoint.
 #
-#   docker compose up --build
-#     landing page      http://localhost:8080
-#     ops dashboard     http://localhost:8080/dashboard   (or :8000/dashboard)
-#     API docs          http://localhost:8080/docs
+# Local:    cp .env.example .env && edit it, then `docker compose up --build`
+# Dokploy:  point the app at this file and set the same variables in the
+#           project's Environment tab. Attach your domain to the `api`
+#           service on port 8000 — it serves the landing page, the dashboard,
+#           the API and the OpenAPI docs from a single origin, so there is no
+#           second web tier to route around.
 #
-# The api service seeds a labelled synthetic history at build time, so the
-# stack is demoable immediately with no manual steps.
+# The nginx tier in web/ is no longer wired up here. It still works if you
+# want a separate static server, but it is not needed: FastAPI serves the
+# built landing page itself.
 
 services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pushpak}
+      # No default, on purpose: compose refuses to start rather than bringing
+      # up a public database with a password from a git-tracked file.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (see .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-pushpak}
+    volumes:
+      - pushpak-pgdata:/var/lib/postgresql/data
+    # api and cron both wait on this; without it they race the server's first
+    # startup and die on "the database system is starting up".
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-pushpak} -d ${POSTGRES_DB:-pushpak}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
   api:
     build: .
     image: pushpak-api
-    container_name: pushpak-api
     environment:
-      PUSHPAK_DB: /data/pushpak.db
+      PUSHPAK_DB_URL: postgresql://${POSTGRES_USER:-pushpak}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-pushpak}
       PUSHPAK_AUDIT_LOG: /data/scrape_audit.jsonl
+      # Licensed fare API. Absent, collection falls back to synthetic and says so.
+      TRAVELPAYOUTS_TOKEN: ${TRAVELPAYOUTS_TOKEN:-}
+      PUSHPAK_SEED_ON_START: ${PUSHPAK_SEED_ON_START:-1}
     volumes:
       - pushpak-data:/data
     ports:
-      - "8000:8000"
+      # Behind Dokploy you can drop this and let Traefik reach the service on
+      # 8000 — publishing it also exposes the app on the VPS IP, bypassing TLS.
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 
-  # Unattended daily collection and indexing. Shares the api service's image
-  # and its data volume; the jobs are idempotent per run_date so a restart
-  # cannot double-collect.
+  # Unattended daily collection and indexing. Shares the api image and its data
+  # volume; jobs are idempotent per run_date so a restart cannot double-collect.
   cron:
     build: .
     image: pushpak-api
-    container_name: pushpak-cron
     command: ["python", "-m", "pushpak.cli", "schedule"]
     environment:
-      PUSHPAK_DB: /data/pushpak.db
+      PUSHPAK_DB_URL: postgresql://${POSTGRES_USER:-pushpak}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-pushpak}
       PUSHPAK_AUDIT_LOG: /data/scrape_audit.jsonl
-      TZ: Asia/Kolkata
+      TRAVELPAYOUTS_TOKEN: ${TRAVELPAYOUTS_TOKEN:-}
+      # The api service owns seeding; this one must not race it.
+      PUSHPAK_SEED_ON_START: "0"
+      TZ: ${TZ:-Asia/Kolkata}
     volumes:
       - pushpak-data:/data
     depends_on:
+      db:
+        condition: service_healthy
       api:
         condition: service_healthy
-    # The image's default healthcheck probes uvicorn, which this service does
-    # not run, so it would fail forever. Replace it with one that actually
-    # means something here: the scheduler can reach its database. That catches
-    # a bad volume mount or permissions, which would otherwise show up only as
-    # silently missing collection days.
+    # The image's healthcheck probes uvicorn, which this service does not run,
+    # so it would fail forever. Replace it with one that means something here:
+    # the scheduler can reach its database. That catches a bad DSN or a database
+    # that never came up, which would otherwise show up only as silently
+    # missing collection days.
     healthcheck:
       test: ["CMD", "python", "-c", "import pushpak.scheduler as s; s.recent(1); print('ok')"]
       interval: 60s
       timeout: 10s
-      start_period: 15s
+      start_period: 20s
       retries: 3
-    restart: unless-stopped
-
-  web:
-    build: ./web
-    image: pushpak-web
-    container_name: pushpak-web
-    depends_on:
-      api:
-        condition: service_healthy
-    ports:
-      - "8080:80"
     restart: unless-stopped
 
 volumes:
   pushpak-data:
+  pushpak-pgdata:
