@@ -738,7 +738,7 @@ async function drawSources() {
     <p class="hint" style="margin-top:12px">
       Licensed channel: <strong>${lic.provider || "n/a"}</strong> ·
       <span class="pill ${lic.configured ? "green" : "amber"}"><span class="dot"></span>${lic.configured ? "configured" : "not configured"}</span>
-      ${lic.configured ? "" : `<br>Set <code>AMADEUS_CLIENT_ID</code> and <code>AMADEUS_CLIENT_SECRET</code>, then use "Run licensed API" for real fares without scraping.`}
+      ${lic.configured ? "" : `<br>Set <code>TRAVELPAYOUTS_TOKEN</code>, then use "Run licensed API" for real fares without scraping.`}
     </p>`;
 }
 

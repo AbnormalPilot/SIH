@@ -295,7 +295,9 @@ class FrequencyGap:
                 "span_days": self.pushpak_span_days,
                 "observations_per_year": round(self.pushpak_observations_per_year, 2),
                 "granularity": (
-                    "5 city pairs x 4 advance-purchase windows, daily"
+                    f"{config.BASKET_SIZE} city pairs x "
+                    f"{len(config.ADVANCE_PURCHASE_WINDOWS)} advance-purchase "
+                    f"windows, daily"
                 ),
             },
             "frequency_multiple": round(self.frequency_multiple, 1),

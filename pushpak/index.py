@@ -179,6 +179,7 @@ class IndexResult:
         agg = d.groupby("_p").apply(
             lambda g: pd.Series({
                 "index_value": g["index_value"].mean(),
+                "index_value_jevons": g["index_value_jevons"].mean(),
                 "n_quotes": int(g["n_quotes"].sum()),
                 "n_cells": int(g["n_cells"].sum()),
                 "n_cells_imputed": int(g["n_cells_imputed"].sum()),
@@ -255,8 +256,17 @@ def compute_index(
         wsum = grp["cell_weight"].sum()
         if wsum <= 0:
             continue
-        contrib = grp["cell_weight"] / wsum * grp["relative"]
+        nw = grp["cell_weight"] / wsum
+        contrib = nw * grp["relative"]
         value = config.BASE_INDEX_VALUE * contrib.sum()
+        # Jevons: the same weights over the same relatives, geometric instead
+        # of arithmetic. Published beside the headline so the choice of
+        # elementary aggregate is a visible number rather than a buried
+        # methodological decision. total_fare is schema-guaranteed positive,
+        # so every relative is > 0 and the log is always defined.
+        value_jevons = config.BASE_INDEX_VALUE * float(
+            np.exp(float((nw * np.log(grp["relative"])).sum()))
+        )
 
         n_quotes = int(grp["n_quotes"].sum())
         n_cells = len(grp)
@@ -269,6 +279,7 @@ def compute_index(
 
         daily_rows.append({
             "period": day, "frequency": "daily", "index_value": float(value),
+            "index_value_jevons": float(value_jevons),
             "n_quotes": n_quotes, "n_cells": n_cells, "n_cells_imputed": n_imp,
             "synthetic_share": syn, "imputed_share": imp_share,
             "soldout_share": sold,
@@ -366,9 +377,9 @@ def explain(result: IndexResult, period: str) -> dict:
     # accumulates ~1e-4 of error across 20 cells and makes the reconciliation
     # check fail against a number that is in fact exact.
     total = float(grp["contribution"].sum())
-    published = float(
-        result.daily.loc[result.daily["period"] == period, "index_value"].iloc[0]
-    )
+    row = result.daily.loc[result.daily["period"] == period]
+    published = float(row["index_value"].iloc[0])
+    published_jevons = float(row["index_value_jevons"].iloc[0])
     return {
         "period": period,
         "formula": "Pushpak(t) = 100 x SUM_c [ w(c) x P(c,t)/P(c,0) ]   where w(c) = w_route x v_ap, renormalised over present cells",
@@ -379,6 +390,13 @@ def explain(result: IndexResult, period: str) -> dict:
         "published_index_value": round(published, 6),
         "reconciles": bool(abs(total - published) < 1e-9),
         "residual": float(total - published),
+        # The headline is arithmetic (Dutot). The geometric (Jevons) aggregate
+        # over identical weights and relatives is reported so the reader can
+        # see how much the published number depends on that choice. Only the
+        # arithmetic form is reconstructable by adding the terms above.
+        "elementary_aggregate": "arithmetic (Dutot)",
+        "published_index_value_jevons": round(published_jevons, 6),
+        "jevons_minus_dutot": round(published_jevons - published, 6),
         "note": (
             "Per-term figures are rounded for display; the reconciliation "
             "compares unrounded sums. Adding the displayed contributions by "

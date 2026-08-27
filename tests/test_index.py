@@ -284,3 +284,87 @@ def test_all_synthetic_data_can_never_be_flagged_green():
     """The labelling guarantee, enforced at the index layer."""
     for imputed in (0.0, 0.05, 0.2, 0.9):
         assert quality_flag(1.0, imputed) != "green"
+
+
+# ---------------------------------------------------------------------------
+# elementary aggregate: arithmetic (Dutot) vs geometric (Jevons)
+# ---------------------------------------------------------------------------
+def _two_day_quotes(prices_by_cell: dict[tuple[str, int], tuple[float, float]]):
+    """Quotes for two days, given each cell's (day0, day1) price."""
+    days = ["2026-08-01", "2026-08-02"]
+    qs = []
+    for (route, ap), pair in prices_by_cell.items():
+        o, d = route.split("-")
+        for day, price in zip(days, pair):
+            qs.append(make_quote(
+                origin=o, destination=d, observation_date=day,
+                travel_date=(date.fromisoformat(day) + timedelta(days=ap)).isoformat(),
+                advance_purchase_days=ap, total_fare=price,
+            ))
+    return frame(qs)
+
+
+def test_jevons_is_exactly_100_in_base_period(two_route_weights):
+    q = _two_day_quotes({
+        ("BOM-DEL", 7): (4000.0, 4000.0), ("BOM-DEL", 15): (3000.0, 3000.0),
+        ("BLR-DEL", 7): (6000.0, 6000.0), ("BLR-DEL", 15): (2500.0, 2500.0),
+    })
+    res = compute_index(q, two_route_weights, windows=(7, 15), base_days=1)
+    assert np.isclose(res.daily["index_value_jevons"].iloc[0], 100.0)
+
+
+def test_jevons_equals_dutot_when_every_cell_moves_by_the_same_factor(two_route_weights):
+    """The two aggregates can only disagree because of *dispersion* in the
+    relatives. Move every cell by exactly 10% — from different levels — and
+    both forms must land on exactly 110."""
+    q = _two_day_quotes({
+        ("BOM-DEL", 7): (4000.0, 4400.0), ("BOM-DEL", 15): (3000.0, 3300.0),
+        ("BLR-DEL", 7): (6000.0, 6600.0), ("BLR-DEL", 15): (2500.0, 2750.0),
+    })
+    res = compute_index(q, two_route_weights, windows=(7, 15), base_days=1)
+    assert np.isclose(res.daily["index_value"].iloc[1], 110.0)
+    assert np.isclose(res.daily["index_value_jevons"].iloc[1], 110.0)
+
+
+def test_jevons_is_strictly_below_dutot_when_relatives_disperse(two_route_weights):
+    """AM-GM: the geometric mean of unequal positive relatives is strictly
+    less than the arithmetic mean. This is why the choice of elementary
+    aggregate is a methodological decision and not a detail."""
+    q = _two_day_quotes({
+        ("BOM-DEL", 7): (4000.0, 8000.0),    # +100%
+        ("BOM-DEL", 15): (3000.0, 3000.0),   # flat
+        ("BLR-DEL", 7): (6000.0, 3000.0),    # -50%
+        ("BLR-DEL", 15): (2500.0, 2500.0),   # flat
+    })
+    res = compute_index(q, two_route_weights, windows=(7, 15), base_days=1)
+    dutot = res.daily["index_value"].iloc[1]
+    jevons = res.daily["index_value_jevons"].iloc[1]
+    assert jevons < dutot
+
+
+def test_jevons_never_exceeds_dutot_on_the_real_basket():
+    """AM-GM must hold on every published day, not only a constructed one."""
+    from pushpak import storage
+    q = storage.load_quotes()
+    if not len(q):
+        pytest.skip("no seeded quotes")
+    d = compute_index(q).daily
+    assert (d["index_value_jevons"] <= d["index_value"] + 1e-9).all()
+
+
+def test_explain_reports_both_aggregates_and_reconciles_only_the_arithmetic(
+    two_route_weights,
+):
+    q = _two_day_quotes({
+        ("BOM-DEL", 7): (4000.0, 5000.0), ("BOM-DEL", 15): (3000.0, 2800.0),
+        ("BLR-DEL", 7): (6000.0, 6100.0), ("BLR-DEL", 15): (2500.0, 3000.0),
+    })
+    res = compute_index(q, two_route_weights, windows=(7, 15), base_days=1)
+    e = explain(res, "2026-08-02")
+    assert e["elementary_aggregate"] == "arithmetic (Dutot)"
+    # the hand-reconstruction still targets the published arithmetic number
+    assert e["reconciles"] is True
+    assert np.isclose(
+        e["published_index_value_jevons"] - e["published_index_value"],
+        e["jevons_minus_dutot"], atol=1e-6,
+    )
