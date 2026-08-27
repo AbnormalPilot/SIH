@@ -273,6 +273,8 @@ class RobotsGate:
         for src in sources:
             sample_url = src.search_url_pattern.format(
                 origin="DEL", dest="BOM",
+                origin_slug=config.CITY_SLUGS["DEL"],
+                dest_slug=config.CITY_SLUGS["BOM"],
                 travel_date="2026-09-15", travel_date_compact="260915",
             )
             verdict = self.check(sample_url)

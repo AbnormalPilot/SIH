@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-26T18:33:37",
+  "generated_at": "2026-08-27T13:24:10",
   "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
   "policy": "fail-closed: unreachable robots.txt is treated as DISALLOWED",
   "results": [
@@ -16,7 +16,7 @@
       "crawl_delay": 6.0,
       "robots_status": null,
       "robots_bytes": 0,
-      "fetched_at": "2026-08-26T13:03:04+00:00",
+      "fetched_at": "2026-08-27T07:53:36+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed / NDC or direct MoU with MoSPI",
@@ -38,7 +38,7 @@
       "crawl_delay": 6.0,
       "robots_status": null,
       "robots_bytes": 0,
-      "fetched_at": "2026-08-26T13:03:19+00:00",
+      "fetched_at": "2026-08-27T07:53:52+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed / NDC or direct MoU with MoSPI",
@@ -60,7 +60,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 10884,
-      "fetched_at": "2026-08-26T13:03:35+00:00",
+      "fetched_at": "2026-08-27T07:54:07+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Skyscanner Partners - Flights Live Prices / Indicative Prices API",
@@ -82,7 +82,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 2141,
-      "fetched_at": "2026-08-26T13:03:35+00:00",
+      "fetched_at": "2026-08-27T07:54:07+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": null
     },
@@ -99,7 +99,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 1430,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-27T07:54:08+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": null
     },
@@ -116,21 +116,22 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 608,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-27T07:54:08+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed or MoU",
         "url": "https://www.spicejet.com",
         "access": "CRAWLING_PERMITTED_BUT_NO_STATIC_FARES",
-        "note": "robots.txt permits the public search page, but fares are rendered client-side from /api/v1, which robots.txt disallows. Compliant static collection therefore yields no prices."
+        "verified_on": "2026-08-27",
+        "note": "robots.txt permits the public search page, but fares are rendered client-side from /api/v1, which robots.txt disallows. Compliant static collection therefore yields no prices \u2014 the search URL returns HTTP 200 and 33 KB whose entire visible text is 'Please enable Javascript to view this site'. Note this rules out a headless browser too, not just a static client: rendering the page makes the browser fetch the disallowed /api/v1 itself. Unlike akasaair.com, the blocker here is permission, not engineering."
       }
     },
     {
       "source": "akasaair.com",
       "source_type": "AIRLINE",
-      "sample_url": "https://www.akasaair.com/book-flight-tickets?origin=DEL&destination=BOM&departureDate=2026-09-15",
-      "url_pattern": "https://www.akasaair.com/book-flight-tickets?origin={origin}&destination={dest}&departureDate={travel_date}",
-      "url": "https://www.akasaair.com/book-flight-tickets?origin=DEL&destination=BOM&departureDate=2026-09-15",
+      "sample_url": "https://www.akasaair.com/flight-booking/new-delhi-to-mumbai",
+      "url_pattern": "https://www.akasaair.com/flight-booking/{origin_slug}-to-{dest_slug}",
+      "url": "https://www.akasaair.com/flight-booking/new-delhi-to-mumbai",
       "host": "www.akasaair.com",
       "allowed": true,
       "reason": "ALLOWED",
@@ -138,13 +139,14 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 133,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-27T07:54:09+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed or MoU",
         "url": "https://www.akasaair.com",
         "access": "CRAWLING_PERMITTED_BUT_NO_STATIC_FARES",
-        "note": "robots.txt contains no Disallow at all. Fares are still rendered client-side, so a compliant static client sees promotional banners rather than route-level quotes."
+        "verified_on": "2026-08-27",
+        "note": "robots.txt contains no Disallow at all \u2014 every path is permitted. The route page returns HTTP 200 and 353 KB, but carries no fare: no rupee amount appears anywhere in the served document, and the 190 KB __NEXT_DATA__ island holds CMS copy (story, navFooter), not prices. The URL also has no travel-date parameter, so this page shape cannot express T+1/T+7/T+15/T+30 at all. Reaching a priced result means driving the booking form through /searchpanel. Sitemap lists 148 city-pair pages, covering 9 of the 15 basket routes (69.2% of basket weight)."
       }
     },
     {
@@ -160,7 +162,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 547,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-27T07:54:09+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": null
     }

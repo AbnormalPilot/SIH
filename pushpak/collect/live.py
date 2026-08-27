@@ -158,6 +158,8 @@ class LiveCollector:
 
         url = src.search_url_pattern.format(
             origin=origin.lower(), dest=dest.lower(),
+            origin_slug=config.CITY_SLUGS.get(origin.upper(), origin.lower()),
+            dest_slug=config.CITY_SLUGS.get(dest.upper(), dest.lower()),
             travel_date=travel_date.isoformat(),
             travel_date_compact=travel_date.strftime("%y%m%d"),
         )
