@@ -21,7 +21,11 @@ from pathlib import Path
 # --------------------------------------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = ROOT / "data"
-DB_PATH = Path(os.environ.get("PUSHPAK_DB", DATA_DIR / "pushpak.db"))
+# Postgres connection string. Everything else in this file is a path; this one
+# is a DSN, so it is named accordingly.
+DB_URL = os.environ.get(
+    "PUSHPAK_DB_URL", "postgresql://pushpak:pushpak@localhost:5432/pushpak"
+)
 AUDIT_LOG_PATH = Path(os.environ.get("PUSHPAK_AUDIT_LOG", DATA_DIR / "scrape_audit.jsonl"))
 DGCA_TRAFFIC_CSV = DATA_DIR / "dgca_domestic_city_pair_traffic.csv"
 ROUTE_WEIGHTS_CSV = DATA_DIR / "route_weights.csv"
@@ -30,9 +34,9 @@ DGCA_FARE_BENCHMARK_CSV = DATA_DIR / "dgca_fare_benchmark.csv"
 # --------------------------------------------------------------------------
 # 1. THE BASKET  (component 1: route selection)
 # --------------------------------------------------------------------------
-# Chosen as the top-5 domestic city pairs by passengers carried over the most
-# recent 12 months in the DGCA release shipped in data/.  Together they carry
-# ~12.9% of ALL Indian domestic passengers.  Weights are recomputed from that
+# Chosen as the top-N domestic city pairs by passengers carried over the most
+# recent 12 months in the DGCA release shipped in data/.  At N=15 they carry
+# ~26.2% of ALL Indian domestic passengers.  Weights are recomputed from that
 # file by scripts/build_weights.py — they are never hand-typed.
 
 IATA = {
@@ -44,6 +48,9 @@ IATA = {
     "CHENNAI": "MAA",
     "PUNE": "PNQ",
     "AHMEDABAD": "AMD",
+    "GOA": "GOI",        # metro code; DGCA_CITY_ALIASES collapses Dabolim + Mopa
+    "SRINAGAR": "SXR",
+    "GUWAHATI": "GAU",
 }
 
 # DGCA renamed Mumbai's entry when Navi Mumbai (NMIA) opened, splitting one
@@ -58,7 +65,10 @@ DGCA_CITY_ALIASES = {
     "MOPA, GOA": "GOA",
 }
 
-BASKET_SIZE = 5
+# Top-15 covers 26.2% of all Indian domestic passengers; top-5 covered 12.9%.
+# build_weights.py fails loudly on any city missing from IATA above, so raising
+# this cannot silently drop a route.
+BASKET_SIZE = 15
 TRAFFIC_WINDOW_MONTHS = 12
 
 
@@ -124,6 +134,16 @@ QUALITY_THRESHOLDS = {
 # --------------------------------------------------------------------------
 # 4. SOURCES  (component 1: >=1 airline site + >=1 OTA)
 # --------------------------------------------------------------------------
+# Some sources publish one SEO page per city pair addressed by full city name
+# rather than IATA code, so a pattern can ask for {origin_slug}/{dest_slug}
+# instead of {origin}/{dest}. Verified against Akasa's sitemap on 2026-08-27:
+# they use "new-delhi", not "delhi", for DEL.
+CITY_SLUGS: dict[str, str] = {
+    iata: city.lower().replace(" ", "-") for city, iata in IATA.items()
+}
+CITY_SLUGS["DEL"] = "new-delhi"
+
+
 @dataclass(frozen=True)
 class Source:
     name: str
@@ -202,7 +222,14 @@ SOURCES: tuple[Source, ...] = (
         source_type="AIRLINE",
         base_url="https://www.akasaair.com",
         robots_url="https://www.akasaair.com/robots.txt",
-        search_url_pattern="https://www.akasaair.com/book-flight-tickets?origin={origin}&destination={dest}&departureDate={travel_date}",
+        # /book-flight-tickets?origin=...  404s — that path does not exist, and
+        # the sitemap_index.xml robots.txt advertises under it 502s. The real
+        # shape, verified 2026-08-27, is one page per city pair by city name.
+        # Note it carries NO travel date: every advance-purchase window for a
+        # route resolves to the same URL, so a run re-requests it once per
+        # window. The per-source budget caps that; a date-aware collector would
+        # have to drive the search form at /searchpanel instead.
+        search_url_pattern="https://www.akasaair.com/flight-booking/{origin_slug}-to-{dest_slug}",
         min_seconds_between_requests=8.0,
     ),
     Source(
@@ -241,30 +268,74 @@ OFFICIAL_DATA_CHANNELS = {
         "channel": "Airline distribution feed or MoU",
         "url": "https://www.spicejet.com",
         "access": "CRAWLING_PERMITTED_BUT_NO_STATIC_FARES",
+        "verified_on": "2026-08-27",
         "note": (
             "robots.txt permits the public search page, but fares are rendered "
             "client-side from /api/v1, which robots.txt disallows. Compliant "
-            "static collection therefore yields no prices."
+            "static collection therefore yields no prices — the search URL "
+            "returns HTTP 200 and 33 KB whose entire visible text is 'Please "
+            "enable Javascript to view this site'. Note this rules out a "
+            "headless browser too, not just a static client: rendering the page "
+            "makes the browser fetch the disallowed /api/v1 itself. Unlike "
+            "akasaair.com, the blocker here is permission, not engineering."
         ),
     },
     "akasaair.com": {
         "channel": "Airline distribution feed or MoU",
         "url": "https://www.akasaair.com",
         "access": "CRAWLING_PERMITTED_BUT_NO_STATIC_FARES",
+        "verified_on": "2026-08-27",
         "note": (
-            "robots.txt contains no Disallow at all. Fares are still rendered "
-            "client-side, so a compliant static client sees promotional banners "
-            "rather than route-level quotes."
+            "robots.txt contains no Disallow at all — every path is permitted. "
+            "The route page returns HTTP 200 and 353 KB, but carries no fare: "
+            "no rupee amount appears anywhere in the served document, and the "
+            "190 KB __NEXT_DATA__ island holds CMS copy (story, navFooter), not "
+            "prices. The URL also has no travel-date parameter, so this page "
+            "shape cannot express T+1/T+7/T+15/T+30 at all. Reaching a priced "
+            "result means driving the booking form through /searchpanel. "
+            "Sitemap lists 148 city-pair pages, covering 9 of the 15 basket "
+            "routes (69.2% of basket weight)."
         ),
     },
     "amadeus": {
         "channel": "Amadeus for Developers, Flight Offers Search",
         "url": "https://developers.amadeus.com",
+        "access": "WITHDRAWN_BY_VENDOR",
+        "retired_on": "2026-07-17",
+        "note": (
+            "Pushpak originally collected licensed fares here. Amadeus "
+            "decommissioned the self-service portal on 17 July 2026: "
+            "api.amadeus.com and test.api.amadeus.com no longer resolve in "
+            "DNS. Amadeus Enterprise is unaffected but requires a commercial "
+            "contract. Kept in this registry rather than deleted, because it "
+            "is the evidence for the entry below."
+        ),
+    },
+    "travelpayouts": {
+        "channel": "Travelpayouts / Aviasales Flight Data API (prices/calendar)",
+        "url": "https://www.travelpayouts.com/developers/api",
         "access": "SELF_SERVICE_API_KEY",
         "note": (
-            "Free self-service test tier with real airline content. This is the "
-            "supported way to obtain live fares without scraping, and Pushpak "
-            "uses it when AMADEUS_CLIENT_ID and AMADEUS_CLIENT_SECRET are set."
+            "Current interim channel for real fares without scraping. Set "
+            "TRAVELPAYOUTS_TOKEN. Serves cached cheapest-fare observations "
+            "aggregated from Aviasales user searches, not live shopping "
+            "quotes: one observation per route-date rather than a "
+            "distribution. Labelled OFFICIAL_API with that caveat in the "
+            "quote's own notes field."
+        ),
+    },
+    "_vendor_risk": {
+        "channel": "Commercial self-service APIs are not a durable base for a "
+                   "national statistic",
+        "url": "https://www.phocuswire.com/amadeus-shut-down-self-service-apis-portal-developers",
+        "access": "FINDING",
+        "note": (
+            "Observed during this build, not hypothesised: Amadeus withdrew "
+            "self-service on 17 July 2026; Kiwi.com Tequila closed self-serve "
+            "signups in 2026; Skyscanner Partners is discretionary. A vendor "
+            "can withdraw access at will, so an official index should rest on "
+            "the government-to-government channel below and treat commercial "
+            "APIs as replaceable."
         ),
     },
     "_general": {
@@ -308,12 +379,10 @@ COLLECT_PII = False            # asserted in tests; the schema has no PII fields
 @dataclass
 class Settings:
     """Runtime knobs, overridable from the CLI."""
-    db_path: Path = field(default_factory=lambda: DB_PATH)
+    db_url: str = field(default_factory=lambda: DB_URL)
     audit_log_path: Path = field(default_factory=lambda: AUDIT_LOG_PATH)
     seed: int = 20260826
 
     def __post_init__(self) -> None:
-        self.db_path = Path(self.db_path)
         self.audit_log_path = Path(self.audit_log_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.audit_log_path.parent.mkdir(parents=True, exist_ok=True)

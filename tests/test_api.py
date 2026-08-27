@@ -16,19 +16,15 @@ from pushpak.index import load_route_weights
 
 
 @pytest.fixture(scope="module")
-def client(tmp_path_factory):
-    db = tmp_path_factory.mktemp("pushpakdb") / "test.db"
-    old_db = config.DB_PATH
-    config.DB_PATH = db
-    storage.init_db(db)
+def client(db_url):
+    storage.init_db(db_url)
     routes = list(load_route_weights()["route_id"])
-    storage.upsert_quotes(generate_backfill(date(2026, 8, 25), 8, routes), db)
+    storage.upsert_quotes(generate_backfill(date(2026, 8, 25), 8, routes), db_url)
 
     import pushpak.api as api_mod
     api_mod._cache = {"mtime": None, "result": None}
     with TestClient(api_mod.app) as c:
         yield c
-    config.DB_PATH = old_db
 
 
 def test_health_reports_the_data_inventory(client):
@@ -236,6 +232,173 @@ def test_dashboard_and_docs_render(client):
     assert client.get("/openapi.json").status_code == 200
 
 
+def test_root_serves_a_page_with_or_without_a_landing_build(client):
+    """One origin: / is the landing page, or the dashboard if it is unbuilt.
+
+    web/dist is a node artefact and is gitignored, so / must not depend on a
+    build having happened — but it must never 500 either.
+    """
+    from pushpak.api import LANDING_DIR
+    r = client.get("/")
+    assert r.status_code == 200
+    built = (LANDING_DIR / "index.html").is_file()
+    assert ('id="root"' in r.text) is built
+
+
+def test_landing_assets_do_not_shadow_the_api(client):
+    """The /assets mount is declared last, so real routes still win."""
+    assert client.get("/api/v1/health").status_code == 200
+    assert client.get("/assets/definitely-not-here.js").status_code == 404
+    assert client.get("/api/v1/bogus").status_code == 404
+
+
 def test_static_handler_rejects_path_traversal(client):
     r = client.get("/static/../../../etc/passwd")
     assert r.status_code in (404, 400)
+
+
+# ---------------------------------------------------------------------------
+# licensed channel: the vendor-withdrawal regression
+# ---------------------------------------------------------------------------
+# Amadeus decommissioned its self-service portal on 2026-07-17 and the hosts
+# stopped resolving. The code kept offering it as a live channel, so `make
+# collect-api` could not succeed on any machine while the README said
+# "Implemented." These pin the shape of that failure so it cannot recur
+# silently for the next provider.
+
+DECOMMISSIONED_HOSTS = ("api.amadeus.com", "test.api.amadeus.com")
+
+
+def test_no_live_code_path_points_at_a_decommissioned_host():
+    """A withdrawn vendor may be *recorded*, never *called*."""
+    import ast
+    from pathlib import Path
+
+    offenders = []
+    for py in Path(config.ROOT / "pushpak").rglob("*.py"):
+        tree = ast.parse(py.read_text())
+        for node in ast.walk(tree):
+            # string constants are fine in comments/docstrings/registries;
+            # what must not exist is a dead host used to build a request URL.
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    name = getattr(t, "id", "")
+                    if name in ("HOST", "HOSTS", "BASE_URL"):
+                        src = ast.unparse(node.value)
+                        for dead in DECOMMISSIONED_HOSTS:
+                            if dead in src:
+                                offenders.append(f"{py.name}:{name}")
+    assert not offenders, f"live endpoint constants point at dead hosts: {offenders}"
+
+
+def test_withdrawn_provider_is_recorded_not_advertised():
+    ch = config.OFFICIAL_DATA_CHANNELS["amadeus"]
+    assert ch["access"] == "WITHDRAWN_BY_VENDOR"
+    assert ch["retired_on"] == "2026-07-17"
+    # and it must not be presented as an obtainable key any more
+    assert ch["access"] != "SELF_SERVICE_API_KEY"
+
+
+def test_licensed_channel_status_declares_what_the_data_actually_is():
+    """The current provider serves cached search data, not live shopping
+    quotes. Saying so is the difference between labelled and misleading."""
+    from pushpak.collect.official_api import status
+    s = status()
+    assert s["configured"] in (True, False)
+    assert "cached" in s["data_character"].lower()
+    assert any(
+        r["status"] == "DECOMMISSIONED" for r in s["retired_providers"]
+    ), "the withdrawal must stay on the record"
+
+
+def test_probe_reports_nothing_rather_than_guessing_when_unconfigured(monkeypatch):
+    from pushpak.collect.official_api import probe
+    monkeypatch.delenv("TRAVELPAYOUTS_TOKEN", raising=False)
+    r = probe()
+    assert r["configured"] is False
+    assert r["cells_probed"] == 0
+    assert r["coverage_share"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# licensed channel: the two live-API findings
+# ---------------------------------------------------------------------------
+# Probing the real provider turned up two things the docs did not say, either
+# of which would have quietly corrupted the index:
+#   1. /v1/prices/calendar accepts a departure date and ignores it, returning
+#      whatever the cache holds across many months.
+#   2. Its rows all carry return_at — they are ROUND-TRIP prices.
+# The collector therefore uses the v3 one-way endpoint and filters to exact
+# travel dates locally. These pin that behaviour.
+
+class _FakeAudit:
+    def record(self, **kw): return "req-1"
+    def flush(self): return 0
+
+
+def _collector_returning(rows):
+    from pushpak.collect.official_api import OfficialApiCollector, OfficialApiConfig
+    c = OfficialApiCollector(_FakeAudit(), OfficialApiConfig(token="x"))
+    c._fetch_month = lambda o, d, m: rows          # no network
+    return c
+
+
+def test_collector_requests_one_way_prices_only():
+    """Round-trip prices are a different quantity from a one-way fare."""
+    import inspect
+    from pushpak.collect import official_api
+    src = inspect.getsource(official_api.OfficialApiCollector._fetch_month)
+    assert '"one_way": "true"' in src, "must never request round-trip prices"
+    assert "prices_for_dates" in official_api.PRICES_PATH
+
+
+def test_only_exact_advance_purchase_dates_are_collected():
+    """A T+9 fare is not evidence about T+7 and must not be snapped into it."""
+    from datetime import date, timedelta
+    obs = date(2026, 8, 26)
+    rows = []
+    for offset in (1, 7, 9, 15, 22, 30):        # 9 and 22 are not windows
+        rows.append({
+            "departure_at": (obs + timedelta(days=offset)).isoformat() + "T10:00:00+05:30",
+            "price": 5000 + offset, "airline": "6E", "flight_number": "123",
+            "transfers": 0,
+        })
+    c = _collector_returning(rows)
+    got = list(c.collect(obs, ["BOM-DEL"], (1, 7, 15, 30)))
+    aps = sorted({q.advance_purchase_days for q in got})
+    assert aps == [1, 7, 15, 30], f"snapped a non-window date into a cell: {aps}"
+    for q in got:
+        actual = (date.fromisoformat(q.travel_date)
+                  - date.fromisoformat(q.observation_date)).days
+        assert actual == q.advance_purchase_days, "ap days must match the dates"
+
+
+def test_collected_quotes_are_labelled_official_api_not_synthetic():
+    from datetime import date, timedelta
+    from pushpak.schema import CollectionMode
+    obs = date(2026, 8, 26)
+    rows = [{
+        "departure_at": (obs + timedelta(days=7)).isoformat() + "T10:00:00+05:30",
+        "price": 6011, "airline": "6E", "flight_number": "123", "transfers": 0,
+    }]
+    q = list(_collector_returning(rows).collect(obs, ["BOM-DEL"], (7,)))
+    # both directional legs are collected: fares are directional even though
+    # the route weight is not
+    assert len(q) == 2
+    assert {(x.origin, x.destination) for x in q} == {("BOM", "DEL"), ("DEL", "BOM")}
+    assert all(x.route_id == "BOM-DEL" for x in q), "both legs share one canonical id"
+    for x in q:
+        assert x.collection_mode is CollectionMode.OFFICIAL_API
+        assert x.total_fare == 6011
+        # no invented base/tax split
+        assert x.base_fare is None and x.taxes_fees is None
+
+
+def test_a_zero_or_negative_price_is_dropped_not_stored():
+    from datetime import date, timedelta
+    obs = date(2026, 8, 26)
+    rows = [{
+        "departure_at": (obs + timedelta(days=7)).isoformat() + "T10:00:00+05:30",
+        "price": 0, "airline": "6E", "flight_number": "1", "transfers": 0,
+    }]
+    assert list(_collector_returning(rows).collect(obs, ["BOM-DEL"], (7,))) == []

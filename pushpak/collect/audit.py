@@ -6,7 +6,7 @@ that applied, the delay we waited, and the outcome. Blocked requests are the
 most important rows in the table — they are the proof the ethical gate fires.
 
 Written to two places on purpose:
-  * SQLite  -> queryable, joins to fare_quotes via audit_request_id
+  * Postgres -> queryable, joins to fare_quotes via audit_request_id
   * JSONL   -> append-only text, survives DB loss, greppable in a demo
 """
 from __future__ import annotations
@@ -28,10 +28,10 @@ AUDIT_COLUMNS = (
 
 
 class AuditLog:
-    def __init__(self, run_id: str, db_path: Optional[Path] = None,
+    def __init__(self, run_id: str, db_url: Optional[str] = None,
                  jsonl_path: Optional[Path] = None):
         self.run_id = run_id
-        self.db_path = db_path or config.DB_PATH
+        self.db_url = db_url or config.DB_URL
         self.jsonl_path = Path(jsonl_path or config.AUDIT_LOG_PATH)
         self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         self._buffer: list[dict[str, Any]] = []
@@ -72,7 +72,7 @@ class AuditLog:
         return rec["request_id"]
 
     def flush(self) -> int:
-        n = storage.write_audit(self._buffer, self.db_path)
+        n = storage.write_audit(self._buffer, self.db_url)
         self._buffer.clear()
         return n
 

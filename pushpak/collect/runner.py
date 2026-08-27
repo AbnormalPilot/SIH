@@ -4,7 +4,7 @@ Three modes, and the difference between them is the whole point:
 
   ``live``      Attempt real scraping only. If sources are robots-blocked the
                 run yields zero priced quotes. That is a valid, honest outcome.
-  ``api``       Licensed API only (Amadeus). Real fares, no scraping. Requires
+  ``api``       Licensed API only. Real fares, no scraping. Requires
                 credentials; without them the run yields nothing rather than
                 quietly substituting something else.
   ``synthetic`` Generate labelled synthetic quotes only.
@@ -69,7 +69,7 @@ def run_collection(
     days: int = 1,
     routes: Optional[list[str]] = None,
     ap_windows: tuple[int, ...] = config.ADVANCE_PURCHASE_WINDOWS,
-    db_path=None,
+    db_url=None,
     seed: int = 20260826,
     persist: bool = True,
     dry_run: bool = False,
@@ -83,13 +83,13 @@ def run_collection(
     observation_date = observation_date or date.today()
     run_id = f"run-{uuid.uuid4().hex[:12]}"
 
-    storage.init_db(db_path)
+    storage.init_db(db_url)
     storage.start_run(run_id, mode, {
         "days": days, "routes": routes, "ap_windows": list(ap_windows),
         "end_date": observation_date.isoformat(), "seed": seed, "dry_run": dry_run,
-    }, db_path)
+    }, db_url)
 
-    audit = AuditLog(run_id, db_path=db_path)
+    audit = AuditLog(run_id, db_url=db_url)
     summary = RunSummary(run_id=run_id, mode=mode)
     all_quotes: list[FareQuote] = []
 
@@ -122,8 +122,8 @@ def run_collection(
 
         # ---- licensed API ------------------------------------------------
         if mode in ("api", "hybrid"):
-            from .official_api import AmadeusCollector
-            with AmadeusCollector(audit) as ac:
+            from .official_api import OfficialApiCollector
+            with OfficialApiCollector(audit) as ac:
                 if ac.configured:
                     api_q = list(ac.collect(obs, routes, ap_windows))
                     day_quotes.extend(api_q)
@@ -138,9 +138,8 @@ def run_collection(
                         )
                 elif mode == "api":
                     summary.notes.append(
-                        "Amadeus credentials not set (AMADEUS_CLIENT_ID / "
-                        "AMADEUS_CLIENT_SECRET). No quotes collected; nothing "
-                        "was substituted."
+                        "Licensed API token not set (TRAVELPAYOUTS_TOKEN). "
+                        "No quotes collected; nothing was substituted."
                     )
 
         # ---- synthetic --------------------------------------------------
@@ -178,6 +177,6 @@ def run_collection(
 
     if persist:
         audit.flush()
-        storage.upsert_quotes(all_quotes, db_path)
-    storage.finish_run(run_id, summary.as_dict(), db_path)
+        storage.upsert_quotes(all_quotes, db_url)
+    storage.finish_run(run_id, summary.as_dict(), db_url)
     return all_quotes, summary

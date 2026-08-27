@@ -1,18 +1,18 @@
-"""SQLite persistence. One file, zero setup, fully inspectable with `sqlite3`.
+"""Postgres persistence. One connection string, everything auditable in SQL.
 
-Chosen over Postgres deliberately: a hackathon reviewer can open data/pushpak.db
-and audit every row without provisioning anything, which is exactly the
-"auditable" property the brief asks for.
+Every table is append-or-upsert keyed on a natural id, so a re-run of a
+collection or an index computation is idempotent: a reviewer can replay a day
+and get the same rows, not duplicates.
 """
 from __future__ import annotations
 
 import json
-import sqlite3
 from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Iterable, Iterator, Optional
 
 import pandas as pd
+import psycopg
+from psycopg.rows import dict_row
 
 from . import config
 from .schema import COLUMNS, FareQuote
@@ -32,9 +32,9 @@ CREATE TABLE IF NOT EXISTS fare_quotes (
     travel_date           TEXT NOT NULL,
     advance_purchase_days INTEGER NOT NULL,
     fare_class            TEXT NOT NULL,
-    base_fare             REAL,
-    taxes_fees            REAL,
-    total_fare            REAL,
+    base_fare             DOUBLE PRECISION,
+    taxes_fees            DOUBLE PRECISION,
+    total_fare            DOUBLE PRECISION,
     currency              TEXT NOT NULL,
     quote_status          TEXT NOT NULL,
     is_imputed            INTEGER NOT NULL DEFAULT 0,
@@ -64,11 +64,11 @@ CREATE TABLE IF NOT EXISTS scrape_audit (
     robots_checked    INTEGER NOT NULL,
     robots_allowed    INTEGER,
     robots_rule       TEXT,
-    crawl_delay_s     REAL,
-    waited_s          REAL,
+    crawl_delay_s     DOUBLE PRECISION,
+    waited_s          DOUBLE PRECISION,
     http_status       INTEGER,
     response_bytes    INTEGER,
-    latency_ms        REAL,
+    latency_ms        DOUBLE PRECISION,
     outcome           TEXT NOT NULL,
     error             TEXT,
     run_id            TEXT
@@ -80,28 +80,34 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts  ON scrape_audit(ts);
 CREATE TABLE IF NOT EXISTS index_values (
     period            TEXT NOT NULL,      -- YYYY-MM-DD | YYYY-Www | YYYY-MM
     frequency         TEXT NOT NULL,      -- daily | weekly | monthly
-    index_value       REAL NOT NULL,
+    index_value       DOUBLE PRECISION NOT NULL,  -- arithmetic (Dutot) elementary aggregate
+    index_value_jevons DOUBLE PRECISION,          -- geometric (Jevons), same weights
     n_quotes          INTEGER NOT NULL,
     n_cells           INTEGER NOT NULL,
     n_cells_imputed   INTEGER NOT NULL,
-    synthetic_share   REAL NOT NULL,
-    imputed_share     REAL NOT NULL,
-    soldout_share     REAL NOT NULL,
+    synthetic_share   DOUBLE PRECISION NOT NULL,
+    imputed_share     DOUBLE PRECISION NOT NULL,
+    soldout_share     DOUBLE PRECISION NOT NULL,
     quality_flag      TEXT NOT NULL,      -- green | amber | red
     detail_json       TEXT,
     computed_at       TEXT NOT NULL,
     PRIMARY KEY (period, frequency)
 );
+-- A database created before the Jevons aggregate existed keeps its old
+-- index_values table under CREATE TABLE IF NOT EXISTS. Add the column rather
+-- than making a reviewer drop their data to read this build.
+ALTER TABLE index_values
+    ADD COLUMN IF NOT EXISTS index_value_jevons DOUBLE PRECISION;
 
 CREATE TABLE IF NOT EXISTS route_index_values (
     period       TEXT NOT NULL,
     frequency    TEXT NOT NULL,
     route_id     TEXT NOT NULL,
-    index_value  REAL NOT NULL,
-    mean_fare    REAL,
-    weight       REAL NOT NULL,
+    index_value  DOUBLE PRECISION NOT NULL,
+    mean_fare    DOUBLE PRECISION,
+    weight       DOUBLE PRECISION NOT NULL,
     n_quotes     INTEGER NOT NULL,
-    imputed_share REAL NOT NULL,
+    imputed_share DOUBLE PRECISION NOT NULL,
     PRIMARY KEY (period, frequency, route_id)
 );
 
@@ -117,13 +123,8 @@ CREATE TABLE IF NOT EXISTS runs (
 
 
 @contextmanager
-def connect(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
-    path = Path(db_path or config.DB_PATH)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+def connect(db_url: Optional[str] = None) -> Iterator[psycopg.Connection]:
+    conn = psycopg.connect(str(db_url or config.DB_URL), row_factory=dict_row)
     try:
         yield conn
         conn.commit()
@@ -131,48 +132,70 @@ def connect(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
-def init_db(db_path: Optional[Path] = None) -> None:
-    with connect(db_path) as conn:
-        conn.executescript(SCHEMA_SQL)
+def _upsert_sql(table: str, cols: list[str], keys: list[str]) -> str:
+    """INSERT ... ON CONFLICT DO UPDATE over every non-key column."""
+    updates = ",".join(f"{c}=EXCLUDED.{c}" for c in cols if c not in keys)
+    return (
+        f"INSERT INTO {table} ({','.join(cols)}) "
+        f"VALUES ({','.join(['%s'] * len(cols))}) "
+        f"ON CONFLICT ({','.join(keys)}) DO UPDATE SET {updates}"
+    )
 
 
-def upsert_quotes(quotes: Iterable[FareQuote], db_path: Optional[Path] = None) -> int:
+def _vals(row: Any, cols: Iterable[str]) -> tuple:
+    """Row values as plain Python scalars.
+
+    pandas hands out numpy scalars, and psycopg has no adapter for numpy.int64.
+    `.item()` unwraps them; anything without it (str, None) passes through.
+    """
+    out = []
+    for c in cols:
+        v = row[c]
+        out.append(v.item() if hasattr(v, "item") else v)
+    return tuple(out)
+
+
+def _frame(conn: psycopg.Connection, sql: str, params: Any = ()) -> pd.DataFrame:
+    """Query -> DataFrame, keeping the column names even on an empty result."""
+    cur = conn.execute(sql, params)
+    cols = [d.name for d in cur.description]
+    return pd.DataFrame(cur.fetchall(), columns=cols)
+
+
+def init_db(db_url: Optional[str] = None) -> None:
+    with connect(db_url) as conn:
+        conn.execute(SCHEMA_SQL)
+
+
+def upsert_quotes(quotes: Iterable[FareQuote], db_url: Optional[str] = None) -> int:
     rows = []
     for q in quotes:
         errs = q.validate()
         if errs:
             raise ValueError(f"invalid FareQuote {q.quote_id}: {errs}")
         r = q.to_row()
-        rows.append(tuple(r[c] for c in COLUMNS))
+        rows.append(_vals(r, COLUMNS))
     if not rows:
         return 0
-    placeholders = ",".join("?" * len(COLUMNS))
-    sql = (
-        f"INSERT INTO fare_quotes ({','.join(COLUMNS)}) VALUES ({placeholders}) "
-        f"ON CONFLICT(quote_id) DO UPDATE SET "
-        + ",".join(f"{c}=excluded.{c}" for c in COLUMNS if c != "quote_id")
-    )
-    with connect(db_path) as conn:
-        conn.executemany(sql, rows)
+    sql = _upsert_sql("fare_quotes", list(COLUMNS), ["quote_id"])
+    with connect(db_url) as conn:
+        conn.cursor().executemany(sql, rows)
     return len(rows)
 
 
-def write_audit(records: Iterable[dict[str, Any]], db_path: Optional[Path] = None) -> int:
+def write_audit(records: Iterable[dict[str, Any]], db_url: Optional[str] = None) -> int:
     records = list(records)
     if not records:
         return 0
     cols = list(records[0].keys())
-    sql = (
-        f"INSERT OR REPLACE INTO scrape_audit ({','.join(cols)}) "
-        f"VALUES ({','.join('?' * len(cols))})"
-    )
-    with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r[c] for c in cols) for r in records])
+    sql = _upsert_sql("scrape_audit", cols, ["request_id"])
+    with connect(db_url) as conn:
+        conn.cursor().executemany(sql, [_vals(r, cols) for r in records])
     return len(records)
 
 
 def load_quotes(
-    db_path: Optional[Path] = None,
+    db_url: Optional[str] = None,
     route_id: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
@@ -181,111 +204,110 @@ def load_quotes(
     sql = "SELECT * FROM fare_quotes WHERE 1=1"
     params: list[Any] = []
     if route_id:
-        sql += " AND route_id = ?"; params.append(route_id)
+        sql += " AND route_id = %s"; params.append(route_id)
     if date_from:
-        sql += " AND observation_date >= ?"; params.append(date_from)
+        sql += " AND observation_date >= %s"; params.append(date_from)
     if date_to:
-        sql += " AND observation_date <= ?"; params.append(date_to)
+        sql += " AND observation_date <= %s"; params.append(date_to)
     if collection_mode:
-        sql += " AND collection_mode = ?"; params.append(collection_mode)
+        sql += " AND collection_mode = %s"; params.append(collection_mode)
     sql += " ORDER BY observation_date, route_id, advance_purchase_days"
-    with connect(db_path) as conn:
-        df = pd.read_sql_query(sql, conn, params=params)
+    with connect(db_url) as conn:
+        df = _frame(conn, sql, params)
     if len(df):
         df["is_imputed"] = df["is_imputed"].astype(bool)
     return df
 
 
-def load_audit(db_path: Optional[Path] = None, limit: int = 500) -> pd.DataFrame:
-    with connect(db_path) as conn:
-        return pd.read_sql_query(
-            "SELECT * FROM scrape_audit ORDER BY ts DESC LIMIT ?", conn, params=[limit]
+def load_audit(db_url: Optional[str] = None, limit: int = 500) -> pd.DataFrame:
+    with connect(db_url) as conn:
+        return _frame(
+            conn, "SELECT * FROM scrape_audit ORDER BY ts DESC LIMIT %s", [limit]
         )
 
 
 def save_index(
-    frame: pd.DataFrame, frequency: str, db_path: Optional[Path] = None
+    frame: pd.DataFrame, frequency: str, db_url: Optional[str] = None
 ) -> int:
     if not len(frame):
         return 0
     cols = [
-        "period", "frequency", "index_value", "n_quotes", "n_cells",
+        "period", "frequency", "index_value", "index_value_jevons",
+        "n_quotes", "n_cells",
         "n_cells_imputed", "synthetic_share", "imputed_share", "soldout_share",
         "quality_flag", "detail_json", "computed_at",
     ]
-    sql = (
-        f"INSERT OR REPLACE INTO index_values ({','.join(cols)}) "
-        f"VALUES ({','.join('?' * len(cols))})"
-    )
-    with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r[c] for c in cols) for _, r in frame.iterrows()])
+    sql = _upsert_sql("index_values", cols, ["period", "frequency"])
+    with connect(db_url) as conn:
+        conn.cursor().executemany(sql, [_vals(r, cols) for _, r in frame.iterrows()])
     return len(frame)
 
 
-def save_route_index(frame: pd.DataFrame, db_path: Optional[Path] = None) -> int:
+def save_route_index(frame: pd.DataFrame, db_url: Optional[str] = None) -> int:
     if not len(frame):
         return 0
     cols = ["period", "frequency", "route_id", "index_value", "mean_fare",
             "weight", "n_quotes", "imputed_share"]
-    sql = (f"INSERT OR REPLACE INTO route_index_values ({','.join(cols)}) "
-           f"VALUES ({','.join('?' * len(cols))})")
-    with connect(db_path) as conn:
-        conn.executemany(sql, [tuple(r[c] for c in cols) for _, r in frame.iterrows()])
+    sql = _upsert_sql("route_index_values", cols, ["period", "frequency", "route_id"])
+    with connect(db_url) as conn:
+        conn.cursor().executemany(sql, [_vals(r, cols) for _, r in frame.iterrows()])
     return len(frame)
 
 
 def load_index(
     frequency: str = "daily",
-    db_path: Optional[Path] = None,
+    db_url: Optional[str] = None,
     date_from: Optional[str] = None,
     date_to: Optional[str] = None,
 ) -> pd.DataFrame:
-    sql = "SELECT * FROM index_values WHERE frequency = ?"
+    sql = "SELECT * FROM index_values WHERE frequency = %s"
     params: list[Any] = [frequency]
     if date_from:
-        sql += " AND period >= ?"; params.append(date_from)
+        sql += " AND period >= %s"; params.append(date_from)
     if date_to:
-        sql += " AND period <= ?"; params.append(date_to)
+        sql += " AND period <= %s"; params.append(date_to)
     sql += " ORDER BY period"
-    with connect(db_path) as conn:
-        return pd.read_sql_query(sql, conn, params=params)
+    with connect(db_url) as conn:
+        return _frame(conn, sql, params)
 
 
 def load_route_index(
-    frequency: str = "daily", db_path: Optional[Path] = None
+    frequency: str = "daily", db_url: Optional[str] = None
 ) -> pd.DataFrame:
-    with connect(db_path) as conn:
-        return pd.read_sql_query(
-            "SELECT * FROM route_index_values WHERE frequency = ? ORDER BY period, route_id",
-            conn, params=[frequency],
+    with connect(db_url) as conn:
+        return _frame(
+            conn,
+            "SELECT * FROM route_index_values WHERE frequency = %s ORDER BY period, route_id",
+            [frequency],
         )
 
 
-def start_run(run_id: str, mode: str, params: dict, db_path: Optional[Path] = None) -> None:
+def start_run(run_id: str, mode: str, params: dict, db_url: Optional[str] = None) -> None:
     from .schema import utc_now_iso
-    with connect(db_path) as conn:
+    with connect(db_url) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO runs (run_id, started_at, mode, params_json) VALUES (?,?,?,?)",
+            "INSERT INTO runs (run_id, started_at, mode, params_json) VALUES (%s,%s,%s,%s) "
+            "ON CONFLICT (run_id) DO UPDATE SET started_at=EXCLUDED.started_at, "
+            "mode=EXCLUDED.mode, params_json=EXCLUDED.params_json",
             (run_id, utc_now_iso(), mode, json.dumps(params, default=str)),
         )
 
 
-def finish_run(run_id: str, summary: dict, db_path: Optional[Path] = None) -> None:
+def finish_run(run_id: str, summary: dict, db_url: Optional[str] = None) -> None:
     from .schema import utc_now_iso
-    with connect(db_path) as conn:
+    with connect(db_url) as conn:
         conn.execute(
-            "UPDATE runs SET finished_at = ?, summary_json = ? WHERE run_id = ?",
+            "UPDATE runs SET finished_at = %s, summary_json = %s WHERE run_id = %s",
             (utc_now_iso(), json.dumps(summary, default=str), run_id),
         )
 
 
-def stats(db_path: Optional[Path] = None) -> dict[str, Any]:
+def stats(db_url: Optional[str] = None) -> dict[str, Any]:
     """Headline counts used by /api/v1/health and the dashboard banner."""
-    with connect(db_path) as conn:
+    with connect(db_url) as conn:
         def one(sql: str, *p: Any) -> Any:
-            cur = conn.execute(sql, p)
-            row = cur.fetchone()
-            return row[0] if row else None
+            row = conn.execute(sql, p).fetchone()
+            return next(iter(row.values())) if row else None
         total = one("SELECT COUNT(*) FROM fare_quotes") or 0
         return {
             "total_quotes": total,
@@ -307,3 +329,27 @@ def stats(db_path: Optional[Path] = None) -> dict[str, Any]:
             "distinct_routes": one("SELECT COUNT(DISTINCT route_id) FROM fare_quotes") or 0,
             "distinct_sources": one("SELECT COUNT(DISTINCT source) FROM fare_quotes") or 0,
         }
+
+
+TABLES = ("scheduled_runs", "route_index_values", "index_values",
+          "scrape_audit", "fare_quotes", "runs")
+
+
+def drop_all(db_url: Optional[str] = None) -> None:
+    """Wipe every Pushpak table. Backs `make clean`, which used to rm a file."""
+    with connect(db_url) as conn:
+        for t in TABLES:
+            conn.execute(f"DROP TABLE IF EXISTS {t} CASCADE")
+
+
+def db_version(db_url: Optional[str] = None) -> tuple:
+    """Cheap change token for caches: (row count, newest scrape timestamp).
+
+    Replaces the SQLite file mtime the API used to watch. Any insert or
+    re-scrape moves one of the two, which is all the cache needs.
+    """
+    with connect(db_url) as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n, MAX(scrape_ts) AS ts FROM fare_quotes"
+        ).fetchone()
+    return (row["n"], row["ts"])

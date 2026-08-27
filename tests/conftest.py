@@ -6,9 +6,27 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from pushpak import config, storage  # noqa: E402
 from pushpak.schema import (  # noqa: E402
     CollectionMode, FareQuote, QuoteStatus, SourceType,
 )
+
+
+@pytest.fixture(scope="session")
+def db_url() -> str:
+    """An empty Pushpak schema in Postgres, or skip.
+
+    There is no per-test database the way there was a per-test SQLite file, so
+    the tests share one server and start from a dropped schema. Point
+    PUSHPAK_DB_URL at a throwaway database — this fixture drops its tables.
+    """
+    url = config.DB_URL
+    try:
+        storage.drop_all(url)
+        storage.init_db(url)
+    except Exception as exc:  # noqa: BLE001
+        pytest.skip(f"no Postgres at {url}: {exc}")
+    return url
 
 
 def make_quote(**kw) -> FareQuote:
