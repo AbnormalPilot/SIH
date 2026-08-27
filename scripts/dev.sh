@@ -14,9 +14,19 @@ WEB_PORT="${PUSHPAK_WEB_PORT:-5173}"
 
 command -v python3 >/dev/null || { echo "python3 not found"; exit 1; }
 
-# Seed on first run so the dashboard is not empty.
-if [ ! -f data/pushpak.db ]; then
-  echo "==> no database yet, seeding 30 days of labelled synthetic quotes"
+# Postgres is not started here. Either point PUSHPAK_DB_URL at your own server
+# or bring up the compose one:  docker compose up -d db
+echo "==> database        ${PUSHPAK_DB_URL:-postgresql://pushpak:pushpak@localhost:5432/pushpak}"
+
+# Seed on first run so the dashboard is not empty. "Empty" is now a row count
+# in Postgres rather than a missing file, and an unreachable database counts as
+# empty so the seed attempt surfaces the real connection error.
+if ! python3 -c "
+from pushpak import storage
+storage.init_db()
+raise SystemExit(0 if storage.stats()['total_quotes'] else 1)
+" 2>/dev/null; then
+  echo "==> no data yet, seeding 30 days of labelled synthetic quotes"
   python3 -m pushpak.cli seed --days 30
   python3 -m pushpak.cli index --tail 3
 fi
