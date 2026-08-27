@@ -9,6 +9,8 @@ web/dist/
 venv/
 .env
 .env.*
+# ...but the template carries no secrets and must ship.
+!.env.example
 # Pre-Postgres SQLite artefact. The project no longer writes this, but an
 # 85 MB file from before the migration may still be sitting in data/.
 data/pushpak.db

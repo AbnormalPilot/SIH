@@ -63,6 +63,22 @@ def cmd_robots_audit(args) -> int:
 
 
 def cmd_collect(args) -> int:
+    if getattr(args, "probe", False):
+        from .collect.official_api import probe
+        r = probe()
+        print(json.dumps(r, indent=2))
+        if not r["configured"]:
+            print("\n  TRAVELPAYOUTS_TOKEN not set. Nothing was probed and "
+                  "nothing was substituted.")
+            return 1
+        print(
+            f"\n  {r['cells_with_a_fare']}/{r['cells_probed']} cells returned a "
+            f"fare ({r['coverage_share']:.1%}); "
+            f"{len(r['routes_with_a_fare'])} routes covered."
+        )
+        print("  Coverage is measured, not assumed. Thin coverage is reported "
+              "as thin, never padded.")
+        return 0
     quotes, summary = run_collection(
         mode=args.mode,
         observation_date=_parse_date(args.date),
@@ -102,6 +118,7 @@ def _load_and_compute():
 
 
 def cmd_index(args) -> int:
+    storage.init_db()          # also applies pending column migrations
     res = _load_and_compute()
     if res is None:
         return 1
@@ -117,7 +134,7 @@ def cmd_index(args) -> int:
           .tail(args.tail).to_string(index=False))
     print(f"\nlatest: {d['index_value'].iloc[-1]:.2f}   "
           f"({len(d)} days, {d['n_quotes'].sum():,} quotes)")
-    print(f"stored daily/weekly/monthly in {config.DB_PATH}")
+    print(f"stored daily/weekly/monthly in {config.DB_URL}")
     return 0
 
 
@@ -309,6 +326,9 @@ def main(argv=None) -> int:
     sp.add_argument("--days", type=int, default=1)
     sp.add_argument("--dry-run", action="store_true",
                     help="check robots + log intent, issue no requests")
+    sp.add_argument("--probe", action="store_true",
+                    help="measure how much of the basket the licensed API "
+                         "actually covers, store nothing")
     sp.set_defaults(func=cmd_collect)
 
     sp = sub.add_parser("seed", help="backfill labelled synthetic history")
