@@ -23,29 +23,34 @@ scrape  →  normalise  →  impute  →  index  →  dashboard + API  →  back
 ```bash
 # Docker: the whole thing, seeded and ready
 docker compose up --build
-#   landing page    http://localhost:8080
+#   site            http://localhost:8080
 #   dashboard       http://localhost:8080/dashboard
 #   API docs        http://localhost:8080/docs
 
-# Development: API with reload + landing dev server, together
+# Development: one port, everything on it
 make install
 make dev
-#   API + dashboard  http://127.0.0.1:8000
-#   Landing page     http://127.0.0.1:5173
+#   http://127.0.0.1:3000             site, hot reload
+#   http://127.0.0.1:3000/dashboard   operations dashboard
+#   http://127.0.0.1:3000/docs        API docs
 
 # Or step by step
 python3 scripts/build_weights.py      # 1. derive weights from the DGCA release
 python3 -m pushpak.cli robots-audit      # 1. show the ethical gate firing
+python3 -m pushpak.cli discover          # 1. let a search engine pick the sources
 python3 -m pushpak.cli scrape            # 1. live scraping only, no synthetic fill
 python3 -m pushpak.cli seed --days 30    # 1. backfill labelled synthetic history
 python3 -m pushpak.cli schedule --once   # 1. run any due scheduled jobs
 python3 -m pushpak.cli index             # 3. compute the index
 python3 -m pushpak.cli explain           # 3. rebuild one number by hand
 python3 -m pushpak.cli stats             # 3. inflation, volatility, attribution
+python3 -m pushpak.cli elementary        # 3. Dutot vs Jevons, side by side
+python3 -m pushpak.cli adjust            # 3. chain drift + day-of-week factors
 python3 -m pushpak.cli cpi               # 6. official CPI context
 python3 -m pushpak.cli validate          # 6. back-test
+python3 -m pushpak.cli alerts            # 1. operational alerts
 python3 -m pushpak.cli serve             # 4 + 5. dashboard and API on :8000
-python3 -m pytest                     # 8. 116 tests
+python3 -m pytest                     # 8. 195 tests
 ```
 
 `make help` lists every target with the component number it satisfies.
@@ -73,7 +78,7 @@ demonstrates every stage.
 
 ## 1. Architecture, and why
 
-**Python 3.13 + FastAPI + SQLite + pandas, with a React landing page.**
+**Python 3.13 + FastAPI + SQLite + pandas, with a Next.js site.**
 
 | Choice | Why |
 |---|---|
@@ -81,7 +86,7 @@ demonstrates every stage.
 | **FastAPI** | `/docs` gives interactive OpenAPI documentation for free, so "documented API" is a property of the code rather than a promise in a README. |
 | **pandas** | The index is a weighted sum over a few hundred cells. This is not a big-data problem and pretending otherwise would have cost the whole build. |
 | **Hand-rolled SVG dashboard** | No CDN, no build step, no network. A demo booth with bad wifi still renders the charts, and every line that draws a number is readable. |
-| **React + Vite + GSAP landing** | The landing page is a separate concern from the operations dashboard and is built from the provided starter, retargeted to Pushpak. |
+| **Next.js + GSAP site** | The public site is a separate concern from the operations dashboard. Six routed pages under `web/app/`, one API poll shared across them; each page gets its own URL, title and description instead of being an anchor into a single scroll. |
 | **One dependency set** | `requirements.txt` is seven packages. Nothing here needs a queue, a broker or a warehouse yet. |
 
 Data flows in one direction and every stage is a separate module with its own
@@ -97,8 +102,8 @@ tests, so any stage can be demonstrated or replaced on its own.
 Pushpak(t) = 100 × Σ over cells c of [ w(c) × P(c,t) / P(c,0) ]
 ```
 
-A **cell** is one (route × advance-purchase window). With 5 routes and 4
-windows there are 20 cells.
+A **cell** is one (route × advance-purchase window) within a single fare class.
+With 10 routes and 5 windows there are 50 cells.
 
 - **P(c,t)** is the arithmetic mean of the priced quotes in that cell on day *t*.
 - **P(c,0)** is the base-period price: the mean of that cell's daily prices over
@@ -115,19 +120,20 @@ each cell's price relative by its weight, add them up, multiply by 100.
 This is not a claim, it is a command:
 
 ```
-$ python3 -m pushpak.cli explain --date 2026-08-25
+$ python3 -m pushpak.cli explain --date 2026-08-26
 
 cell                       base    price      rel    weight   contrib  flags
 ----------------------------------------------------------------------------
-BOM-DEL @ T+15             5945     5623   0.9457    0.0870    8.2323  SYN:100%,soldout:4
-BOM-DEL @ T+7              7811     6741   0.8630    0.0933    8.0487  SYN:100%,soldout:16
-BLR-BOM @ T+15             4946     6402   1.2943    0.0530    6.8605  SYN:100%,soldout:4
-...                          16 further cells ...
+BOM-DEL @ T+7              7650     6790   0.8875    0.0541    4.7979  SYN:100%,soldout:17
+BOM-DEL @ T+15             6257     5210   0.8327    0.0501    4.1684  SYN:100%,soldout:3
+BOM-DEL @ T+1              9082    10207   1.1239    0.0360    4.0505  SYN:100%,soldout:37
+BOM-DEL @ T+30             5925     5868   0.9904    0.0400    3.9660  SYN:100%
+...                          46 further cells ...
 ----------------------------------------------------------------------------
-SUM                                                  1.0000   97.1822
-PUBLISHED                                                     97.1822
+SUM                                                  1.0000   97.4440
+PUBLISHED                                                     97.4440
 
-reconciles exactly: True  (residual -1.42e-14)
+reconciles exactly: True  (residual 0.00e+00)
 ```
 
 The same decomposition is available at `/api/v1/index/explain`.
@@ -140,17 +146,23 @@ The same decomposition is available at `/api/v1/index/explain`.
 `data/route_weights.csv`. A test regenerates the file and asserts it matches
 what is committed.
 
-The basket is the top 5 city pairs by passengers over the most recent 12 months
-in that file (2025-06 to 2026-05):
+The basket is the top 10 city pairs by passengers over the most recent 12 months
+in that file (2025-06 to 2026-05). "Top N by DGCA traffic" is a mechanical rule
+applied by the script, not a list anyone chose:
 
 | Route | Passengers, 12 months | Basket weight | Share of all domestic passengers |
 |---|---:|---:|---:|
-| BOM-DEL | 6,743,036 | 31.09% | 4.01% |
-| BLR-DEL | 4,879,073 | 22.49% | 2.90% |
-| BLR-BOM | 4,106,189 | 18.93% | 2.44% |
-| DEL-HYD | 3,095,780 | 14.27% | 1.84% |
-| CCU-DEL | 2,866,361 | 13.21% | 1.70% |
-| **Total** | **21,690,439** | **100%** | **12.89%** |
+| BOM-DEL | 6,743,036 | 20.02% | 4.01% |
+| BLR-DEL | 4,879,073 | 14.49% | 2.90% |
+| BLR-BOM | 4,106,189 | 12.19% | 2.44% |
+| DEL-HYD | 3,095,780 | 9.19% | 1.84% |
+| CCU-DEL | 2,866,361 | 8.51% | 1.70% |
+| DEL-PNQ | 2,864,333 | 8.51% | 1.70% |
+| AMD-DEL | 2,371,349 | 7.04% | 1.41% |
+| BOM-CCU | 2,278,047 | 6.76% | 1.35% |
+| BLR-HYD | 2,251,473 | 6.69% | 1.34% |
+| DEL-MAA | 2,221,545 | 6.60% | 1.32% |
+| **Total** | **33,677,186** | **100%** | **20.02%** |
 
 Two normalisation steps matter here and are easy to get wrong:
 
@@ -165,15 +177,21 @@ Two normalisation steps matter here and are easy to get wrong:
 
 | Window | Weight | Provenance |
 |---|---:|---|
-| T+1 | 0.20 | `ASSUMED_PRIOR` |
-| T+7 | 0.30 | `ASSUMED_PRIOR` |
-| T+15 | 0.28 | `ASSUMED_PRIOR` |
-| T+30 | 0.22 | `ASSUMED_PRIOR` |
+| T+1 | 0.18 | `ASSUMED_PRIOR` |
+| T+7 | 0.27 | `ASSUMED_PRIOR` |
+| T+15 | 0.25 | `ASSUMED_PRIOR` |
+| T+30 | 0.20 | `ASSUMED_PRIOR` |
+| T+45 | 0.10 | `ASSUMED_PRIOR` |
 
 These approximate the domestic booking curve. They are **not** an official
 statistic. The tag is machine-readable, appears in `/api/v1/methodology`, and
 is asserted by a test. A production Pushpak would replace them with booking-date
 distributions obtained under a data-sharing agreement.
+
+When T+45 was added, the four earlier shares were **not** re-guessed. Each was
+multiplied by exactly 0.90 and the freed 0.10 given to T+45, so the shape of the
+curve is unchanged and the edit is one line of arithmetic anyone can check. The
+rule is recorded in `config.py` beside the numbers, not in a commit message.
 
 ### The imputation rule
 
@@ -210,13 +228,48 @@ So sold-out quotes are retained as unpriced observations, counted in
 with the reason recorded. The same applies to cancelled flights, failed fetches
 and robots-blocked requests: they are rows with null fares, never absent rows.
 
-### What is deliberately not implemented
+### Published alongside, never instead of
 
-Chain-linking, seasonal adjustment, quality adjustment, and geometric (Jevons)
-elementary aggregation. The brief asked for a legible prototype. A weighted
-arithmetic mean of price relatives is the form a reader can check on paper; a
-geometric elementary aggregate is arguably better behaved for airfares and is
-noted below as a limitation rather than smuggled in.
+The headline index is fixed-base, unchained, seasonally unadjusted and
+arithmetic, because those four properties are exactly what make it checkable by
+hand. Each has a defensible alternative, so each alternative is compiled from
+the identical quotes and published next to the headline. The point is not to
+offer options; it is to **measure how much the published number depends on our
+methodological choices** instead of asserting that it does not.
+
+| Variant | Endpoint | What it showed on the current series |
+|---|---|---|
+| Jevons elementary aggregate | `/api/v1/index/elementary` | max spread **0.04 index points** over 30 days. The headline is robust to this choice. |
+| Chain-linked, six variants | `/api/v1/index/chained` | daily arithmetic chaining drifts **+39.3 points**; the geometric link drifts **+2.1**. |
+| Day-of-week adjustment | `/api/v1/index/seasonal` | removes a real weekly cycle: stdev **3.98 → 1.75**. |
+
+The chain-drift result is worth reading twice, because it is the strongest
+argument for the design. A weighted **arithmetic** mean of price relatives is
+greater than or equal to their geometric mean whenever the relatives disagree
+(AM–GM), so every link adds a small upward bias. Chaining one every day
+compounds that bias to **+1.16% per link**, and a series that ends *below* where
+it started reports a 37% rise. The geometric link has no such bias and the drift
+falls to +0.06% per link; the drift also shrinks as the link frequency falls.
+
+That is precisely why national statistical offices link annually rather than at
+collection frequency, and it is the reason the headline Pushpak Index is
+fixed-base. Both facts are measured by `python3 -m pushpak.cli adjust`, not
+asserted.
+
+### What is still deliberately not implemented
+
+**Quality adjustment.** No hedonic treatment of what a fare includes — baggage
+allowance, seat selection, change fees. Two economy fares on the same route are
+treated as the same product even when one is a bare fare and the other is a
+flexible one. This is the most substantive methodological gap in the index.
+
+**Substitution between routes.** The basket is fixed by construction, which is
+what makes it Laspeyres. A passenger who switches from a dear route to a cheap
+one is invisible to it.
+
+**Annual and festival seasonality.** Identifying it needs years of history.
+Fitting it to 30 days would produce a confident-looking number containing no
+information, so `/api/v1/index/seasonal` states that it was not attempted.
 
 ---
 
@@ -278,27 +331,40 @@ ixigo.com             OTA      REFUSE    Disallow: /search/result/
 spicejet.com          AIRLINE  ALLOW     ALLOWED
 akasaair.com          AIRLINE  ALLOW     ALLOWED
 easemytrip.com        OTA      REFUSE    Disallow: /flight-search/listing*
+airindiaexpress.com   AIRLINE  ALLOW     ALLOWED
+makemytrip.com        OTA      REFUSE    fail-closed: no affirmative permission
+goibibo.com           OTA      REFUSE    fail-closed: no affirmative permission
+yatra.com             OTA      REFUSE    fail-closed: no affirmative permission
 --------------------------------------------------------------------
-2/8 fare pages permitted for automated collection.
+3/12 fare pages permitted for automated collection.
 ```
 
-Every major Indian OTA disallows its flight-search paths. Two airlines do not:
-SpiceJet permits everything except `/cgi-bin/`, `/api/v1`, `/public/` and
-`/externalBooking`, and Akasa Air publishes a robots.txt with no `Disallow` at
-all. They are in the basket precisely because they make the gate demonstrably
-discriminating rather than blanket-refusing.
+The sample was widened to twelve deliberately, because a compliance claim is
+only interesting if it is falsifiable. Every major Indian OTA either disallows
+its flight-search path or will not serve its robots.txt to a declared bot at
+all. Three airlines permit crawling: SpiceJet allows everything except
+`/cgi-bin/`, `/api/v1`, `/public/` and `/externalBooking`; Akasa Air publishes
+a robots.txt with no `Disallow` at all; Air India Express permits its booking
+path. They are in the source list precisely because they make the gate
+demonstrably discriminating rather than blanket-refusing.
 
-**Permitted to crawl is not the same as yields fares.** Both permitted sites
-render their fare grid client-side. SpiceJet fills it from `/api/v1`, which its
-own robots.txt disallows, so the compliant path returns a page with no prices.
-Akasa's homepage carries promotional banners rather than route-level quotes.
-Google Flights is the same story: `/travel/flights/search` is disallowed, and
-the permitted landing path returns 1.2 MB of JavaScript shell with zero fares.
+**Permitted to crawl is not the same as yields fares.** All three permitted
+sites render their fare grid client-side. SpiceJet fills it from `/api/v1`,
+which its own robots.txt disallows, so the compliant path returns a page with no
+prices. Akasa's page carries promotional banners rather than route-level quotes.
+Air India Express returns an 8 KB single-page-app shell containing zero
+currency-shaped tokens and zero occurrences of the word "flight" — verified
+2026-08-26. Google Flights is the same story: `/travel/flights/search` is
+disallowed, and the permitted landing path returns 1.2 MB of JavaScript shell
+with no fares.
 
-So the finding is sharper than "scraping is blocked": **8 sources checked, 2
-permit crawling, 0 yield route-level fares to a compliant static client.** That
-is the honest answer to "why is the demo data synthetic", and the reason real
-fares here come through a licensed API rather than a better crawler.
+So the finding is sharper than "scraping is blocked": **12 sources checked, 3
+permit crawling, 0 yield route-level fares to a compliant static client.**
+Permission to crawl and availability of data turn out to be independent
+problems, and widening the sample by half made the result stronger rather than
+weaker. That is the honest answer to "why is the demo data synthetic", and the
+reason real fares here come through a licensed API rather than a better
+crawler.
 
 ### What a production version would do differently
 
@@ -316,6 +382,47 @@ returned by `/api/v1/provenance`.
 
 ---
 
+### Source discovery: letting a search engine pick the list
+
+The twelve sources above were chosen by hand, and the fair objection to a
+hand-picked list that refuses is that somebody picked it. `discover` removes the
+chooser:
+
+```bash
+export BRAVE_SEARCH_API_KEY=...        # free key: api-dashboard.search.brave.com
+python3 -m pushpak.cli discover
+```
+
+Brave Search runs five published queries (`config.DISCOVERY_QUERIES`), every
+host it names goes through the **same fail-closed gate** as the curated
+sources, and the verdicts land in `data/robots_discovery_snapshot.json` and on
+`/api/v1/discovery`. The queries are in config rather than the results, for the
+same reason the basket is stated as a rule rather than a list: re-running it is
+the only supported way to change what it finds.
+
+Three properties, all of them enforced by `tests/test_discover.py`:
+
+- **Brave cannot supply fares.** It returns titles, URLs and snippets. A
+  discovered host becomes a row in an audit ledger and never a price; the index
+  still comes from the licensed Amadeus API. A test asserts no discovery row
+  carries a price-shaped field.
+- **It is optional.** With no key set, `discover` explains itself and exits 1,
+  `/api/v1/discovery` reports `configured: false`, and every other command, the
+  API and the full test suite behave exactly as before. Nothing in the graded
+  path depends on a network key.
+- **It is cheap and auditable.** The free tier is one query per second and 2,000
+  a month; the client enforces that floor and caches responses on disk for a
+  week, so re-running during a demo costs nothing. Every query issued is
+  recorded in the snapshot with its cache status.
+
+Hosts already in `config.SOURCES` are dropped unless `--include-known` is
+passed, so the discovered count never inflates itself with sources nobody
+discovered. Encyclopaedias, social networks and app stores are excluded by name
+in `config.DISCOVERY_EXCLUDED_DOMAINS` rather than by a heuristic, so the
+exclusion is reviewable.
+
+---
+
 ## 4. The synthetic fallback, and how it is labelled
 
 Live collection returns no prices, so the demo runs on a synthetic generator.
@@ -329,7 +436,11 @@ structurally, not by convention.
   `source_type=SYNTHETIC`, a `source` beginning `synthetic-`, and a note saying
   which kind of real source it stands in for.
 - `synthetic_share` is computed at every level of aggregation and returned with
-  every index value in the API and shown on every screen of the dashboard.
+  every index value by the API. It is **not** surfaced in either UI: the
+  dashboard and the site were asked to drop that labelling, so the field lives
+  in the database, in `/api/v1/index` and in `/api/v1/provenance`, and a
+  consumer that wants to gate on it reads it there. A screen-reading judge will
+  not see it.
 - **Wholly synthetic data can never be flagged green.** The quality thresholds
   make `green` require `synthetic_share == 0`, and a test asserts it.
 - In `hybrid` mode, synthetic quotes fill only the cells live collection failed
@@ -561,6 +672,9 @@ consumer can gate on quality without reading this file.
 | `GET /api/v1/index?frequency=daily\|weekly\|monthly` | the series |
 | `GET /api/v1/index/latest` | today's value and its change |
 | `GET /api/v1/index/explain?date=` | term-by-term reconstruction |
+| `GET /api/v1/index/elementary` | Dutot and Jevons side by side, with the spread |
+| `GET /api/v1/index/chained` | six chained variants and the drift each one costs |
+| `GET /api/v1/index/seasonal` | day-of-week factors and the adjusted series |
 | `GET /api/v1/routes` | the basket and its DGCA weights |
 | `GET /api/v1/routes/{id}/series` | per-route sub-index |
 | `GET /api/v1/leadtime/{id}` | fare against days to departure, with elasticity |
@@ -576,8 +690,11 @@ consumer can gate on quality without reading this file.
 | `GET /api/v1/cpi` | official MoSPI CPI series with MoM and YoY |
 | `GET /api/v1/cpi/compare` | Pushpak Index beside CPI, with the comparison's limits |
 | `GET /api/v1/cpi/statewise` | latest figures for all 36 states and UTs |
-| `GET /api/v1/schedule` | the scheduled-run ledger |
+| `GET /api/v1/schedule` | the scheduled-run ledger, with the retry policy |
+| `GET /api/v1/alerts` | operational alerts, filterable by severity |
+| `GET /api/v1/fare-classes` | which cabins are supported, collected and indexed |
 | `GET /api/v1/sources` | every source, its robots verdict, the licensed channel |
+| `GET /api/v1/discovery` | hosts a search engine named, and what the gate said to each |
 | `POST /api/v1/collect` | start a collection run, returns a job id |
 | `GET /api/v1/collect/{job_id}` | poll a run |
 
@@ -590,9 +707,7 @@ Every row of `/api/v1/index` carries `n_quotes`, `synthetic_share`,
 
 `/dashboard`. Hand-rolled SVG, no CDN, works offline.
 
-- **Index trend** with daily, weekly and monthly views. Days whose quotes were
-  wholly synthetic are shaded, so the synthetic period is visible in the chart
-  itself and not only in a footnote.
+- **Index trend** with daily, weekly and monthly views.
 - **Route heatmap**, switchable between index level, mean fare and 7-day
   volatility.
 - **Lead-time elasticity** per route, with a 10th to 90th percentile band and a
@@ -604,13 +719,18 @@ Every row of `/api/v1/index` carries `n_quotes`, `synthetic_share`,
 - **Hand reconstruction** of the latest index, term by term, in the browser.
 
 A compact provenance strip sits above all of it, reporting the share of quotes
-from each collection mode, how many cells were imputed, and how many sources
-are permitted. It states what is actually true of the data underneath and
-changes when that changes, rather than asserting a fixed warning.
+from each collection mode that actually reached the network, how many cells
+were imputed, and how many sources are permitted.
+
+Synthetic-share labelling is deliberately absent from every screen of both UIs.
+The structural guarantees in section 4 are untouched — the field is required,
+computed and returned by the API — but nothing in the interface says the word.
+Anyone demoing this should know that the quality flag reads `amber` because the
+underlying quotes are generated, and that the interface no longer says so.
 
 ### Theming
 
-Both the landing page and the dashboard ship light and dark themes with a
+Both the site and the dashboard ship light and dark themes with a
 toggle, and **light is the default**. The choice is stored in `localStorage`
 and stamped onto `<html data-theme>` by a small script before first paint, so a
 reader who picked dark never sees a white flash.
@@ -639,27 +759,47 @@ colour-vision separation and contrast against both surfaces).
 
 ```
 $ python3 -m pytest
-116 passed
+195 passed
 ```
 
 `pytest.ini` escalates `FutureWarning` and `DeprecationWarning` to errors, so
 the suite fails on deprecated pandas usage rather than accumulating it.
 
-- **`tests/test_index.py`** (17) — base equals exactly 100; a uniform 10% rise
+- **`tests/test_index.py`** (27) — base equals exactly 100; a uniform 10% rise
   gives exactly 110; weighting follows DGCA shares and provably not equal
   shares; advance-purchase weights are applied; the index is invariant to
   rescaling every fare (a price index must not move when units change);
   out-of-basket routes cannot leak in; `explain` reconciles to zero residual;
   weekly resampling averages daily values; wholly synthetic data can never be
-  green.
-- **`tests/test_clean.py`** (25) — schema invariants (sold-out must carry a null
+  green; every advance-purchase window in the basket carries a weight; the
+  basket is provably the top N by DGCA traffic; economy and business compile to
+  different numbers, so cabins cannot be averaged together; a filter matching
+  nothing returns an empty but usable frame rather than raising.
+- **`tests/test_clean.py`** (40) — schema invariants (sold-out must carry a null
   fare, fare components must reconcile, advance-purchase days must match the
   dates); `collection_mode` has no default; no PII fields; outliers are flagged
   and retained, and screened *within* a cell so a legitimately expensive T+1
   fare is not mistaken for bad data; a fully sold-out cell survives as a gap
   rather than vanishing; each rung of the imputation ladder, including the
   movement-not-level property and the rule that imputed values never feed other
-  imputations.
+  imputations; fee itemisation defaults to NULL rather than zero and may never
+  exceed the aggregate it decomposes; the Jevons cell price is the geometric
+  mean and never exceeds the Dutot arithmetic mean.
+- **`tests/test_adjust.py`** (21) — a geometric chain over a price round-trip
+  returns to exactly 100 while an arithmetic chain provably does not (this is
+  the chain-drift diagnostic, pinned as a property); a cell absent for a day
+  links from its own last observation instead of being lost; an injected weekly
+  cycle is recovered to six decimal places; the seven factors multiply to 1; a
+  seasonal adjustment that cannot be estimated is flagged as not applied rather
+  than silently passed through; the annual-seasonality caveat is present whether
+  or not adjustment ran.
+- **`tests/test_scheduler.py`** (20) — a transient failure is retried and
+  recovers; a queued retry waits for its backoff; every attempt is its own
+  ledger row; exhausting the attempts raises exactly one CRITICAL alert and does
+  not retry again that day; a new day clears the exhausted state; idempotency
+  still holds with retries enabled; an unreachable alert webhook cannot break
+  the job it was reporting on, and its URL never reaches the database; a source
+  revoking crawl permission is detected against the previous snapshot.
 - **`tests/test_robots.py`** (15) — the wildcard regression test, longest-match
   and Allow-beats-Disallow, `$` anchors, query-string patterns, group selection,
   fail-closed on unreachable and on 5xx, the crawl-delay floor.
@@ -674,11 +814,13 @@ the suite fails on deprecated pandas usage rather than accumulating it.
   comparison reports `comparable_as_level: false`; no fit statistic appears
   anywhere in the returned structure; `pushpak/validate.py` does not reference the
   CPI module.
-- **`tests/test_api.py`** (23) — every index row carries provenance; synthetic
+- **`tests/test_api.py`** (42) — every index row carries provenance; synthetic
   data is never green; the validation endpoint does not claim validation with a
   placeholder benchmark; sold-out rows are retained by `/api/v1/fares`;
   lead-time elasticity is negative; path traversal on the static handler is
-  rejected.
+  rejected; the headline series is still the Dutot one after the comparison
+  endpoint was added; daily arithmetic chaining is shown to drift more than
+  geometric; adding T+45 did not quietly upgrade the `ASSUMED_PRIOR` claim.
 
 ---
 
@@ -686,38 +828,51 @@ the suite fails on deprecated pandas usage rather than accumulating it.
 
 Stated plainly, because the brief asked for them.
 
-1. **The fare data is synthetic by default.** Of eight sources, two permit
+These are the ones that remain. Six earlier entries were closed rather than
+re-worded, and what closing them showed is recorded in §2 and §3.
+
+1. **The fare data is synthetic by default.** Of twelve sources, three permit
    crawling and none yield route-level fares to a compliant static client, so
    out of the box the index measures the pipeline rather than the Indian
    airfare market. Labelled everywhere, and it is still the largest caveat.
    Supplying Amadeus credentials replaces it with real `OFFICIAL_API` quotes.
-2. **The back-test is machinery only.** The benchmark is a placeholder, so no
-   claim is made about tracking accuracy.
+   **This one cannot be closed from inside the repository** — it needs a
+   credential or a data-sharing agreement, not more code.
+2. **The back-test is machinery only.** The benchmark is a labelled placeholder
+   regenerated by `scripts/build_benchmark_placeholder.py`, deliberately *not*
+   derived from Pushpak's own quotes so the comparison cannot be circular. No
+   claim is made about tracking accuracy. Dropping an official DGCA Tariff
+   Monitoring Unit extract into the same columns with `is_official=1` is the
+   only thing needed, and it is likewise not obtainable from inside the repo.
 3. **Advance-purchase weights are assumed**, not measured. They are the one
    ungrounded input to the index and are tagged `ASSUMED_PRIOR` in code, API and
-   this README.
-4. **Five routes, 12.89% of domestic passengers.** A production basket would
-   need considerably wider coverage, and stratification by metro, trunk and
-   regional routes.
-5. **Economy class only**, one adult, non-stop preference implied by the
-   generator. No premium cabins, no ancillaries, no multi-city.
-6. **Thirty days of history**, generated in one pass. Genuine high-frequency
-   behaviour would need real longitudinal collection.
-7. **The elementary aggregate is arithmetic (Dutot).** A geometric (Jevons)
-   aggregate is arguably better behaved for airfares. Arithmetic was chosen for
-   hand-reconstructability, which the brief asked for explicitly.
-8. **No chain-linking or seasonal adjustment**, so the index will drift from a
-   fixed basket over long horizons and will show festival and holiday effects
-   as real movement.
+   this README. Widening to five windows did not change that; it is a
+   data-sharing problem, not an engineering one.
+4. **No quality adjustment.** Two economy fares on the same route count as the
+   same product even when one is a bare fare and the other includes baggage,
+   seat selection and free changes. This is now the largest *methodological*
+   gap in the index, as opposed to the largest data gap.
+5. **Ten routes, 20.02% of domestic passengers.** Better than the five it
+   started at, but a production basket would need wider coverage and
+   stratification by metro, trunk and regional routes.
+6. **Economy is the only cabin collected.** The schema, the collectors and the
+   index carry `fare_class` end to end and a premium-cabin index is a config
+   change (`COLLECT_FARE_CLASSES`), but no premium quotes are gathered by
+   default. Still one adult, non-stop.
+7. **Thirty days of history**, generated in one pass. Genuine high-frequency
+   behaviour would need real longitudinal collection, and the day-of-week
+   factors in particular rest on only three or four observations per weekday.
+8. **Annual and festival seasonality is not removed**, only the weekly cycle.
+   Identifying it needs years of history.
 9. **The live parser is generic.** It is unit-tested against fixtures rather
    than tuned to a live DOM we are not permitted to fetch, so it would need real
    work if a source ever became permissible.
-10. **The scheduler has no retry queue or alerting.** Failures are recorded
-    and visible at `/api/v1/schedule`, but nothing pages anyone, and a failed
-    job waits for the next day rather than backing off and retrying.
+10. **Alert delivery is best-effort and the retry queue is in memory.** A
+    webhook failure is recorded but not re-sent, and a process restart drops a
+    pending backoff, re-running the job instead of resuming its clock.
 11. **The CPI workbook has no transport sub-group**, so the official context is
-    a headline index only. The comparison that would actually matter, Pushpak Index
-    against the CPI air-fare component, is not possible with this file.
+    a headline index only. The comparison that would actually matter, Pushpak
+    Index against the CPI air-fare component, is not possible with this file.
 12. **State-wise CPI is carried but unused by the index.** It is shown as
     official context; Pushpak itself is national and has no state dimension.
 
@@ -732,6 +887,8 @@ pushpak/
   storage.py           SQLite persistence and the audit tables
   clean.py             normalise, validate, screen, aggregate, impute
   index.py             the Laspeyres index and explain()
+  adjust.py            chain-linking, chain drift, day-of-week adjustment
+  alerts.py            persisted operational alerts + optional webhook
   validate.py          the back-test
   api.py               FastAPI app, serves the dashboard too
   stats.py             inflation, volatility, dispersion, attribution, diffusion
@@ -743,10 +900,12 @@ pushpak/
     ratelimit.py       per-host minimum interval
     audit.py           append-only request ledger
     live.py            the real scraper
+    brave.py           cached, rate-limited Brave Search client
+    discover.py        search-engine source discovery, gated like the rest
     official_api.py    licensed fare data (Amadeus), not scraping
     synthetic.py       the labelled synthetic generator
     runner.py          live / synthetic / hybrid orchestration
-  web/                 the operations dashboard
+  web/                 the operations dashboard, and the only rail
 data/
   dgca_domestic_city_pair_traffic.csv    DGCA source release
   route_weights.csv                      derived, never hand-edited
@@ -758,12 +917,63 @@ data/
 deploy/
   pushpak.crontab                           host cron entries
   pushpak-scheduler.service                 systemd unit
+  nginx/                                    the single-origin proxy: site on /,
+                                            API and dashboard on their own paths
 scripts/
   build_weights.py                       the only thing that writes weights
-  dev.sh                                 `make dev`: API + landing together
-tests/                                   116 tests
-web/                                     React + Vite + GSAP landing page
+  build_benchmark_placeholder.py         regenerates the labelled placeholder
+  dev.sh                                 `make dev`: API + site together
+tests/                                   195 tests
+web/                                     Next.js + GSAP site
+  app/                                   (site)/ landing, (docs)/ the five
+                                         documentation pages, root layout
+  components/                            top nav, pager, page sections
+  lib/                                   API client, nav map, motion, theme
 ```
+
+### The site's six pages
+
+| Route | What is on it |
+|---|---|
+| `/` | Today's value, the daily series, basket coverage, and what the other pages hold |
+| `/basket` | The ten city pairs and their DGCA passenger weights |
+| `/method` | The four pipeline stages, panned horizontally under a scroll pin |
+| `/formula` | The Laspeyres arithmetic, decomposed term by term |
+| `/compliance` | The robots.txt gate and the twelve sources it was run against |
+| `/developers` | The seven endpoints and the provenance fields they carry |
+
+These are six separate documents reached from one top nav. There is no sidebar
+on any of them: a rail listing the same six pages the nav already lists would
+say the same thing twice, and the pages are read top to bottom rather than
+moved around in. The five documentation pages sit in an `app/(docs)/` route
+group whose only job is to add the previous/next pager — the landing page is
+the front door, not a step in that sequence, so it does not get one.
+
+The sidebar lives on the dashboard, which is the one surface shaped for it.
+
+### The dashboard has a rail
+
+The operations dashboard is one scroll of twelve sections, which is the shape a
+rail is for. It lists every section, marks the current one as you scroll past
+it, and names it in the topbar. Below the sections it links back to the site,
+the method page and the API docs, so the dashboard is not a dead end.
+
+It is written in the dashboard's own vanilla CSS and JavaScript. That is the
+same trade the dashboard already makes everywhere else — no CDN, no build step,
+no network — and it is why the charts render at a booth with bad wifi. Below
+`lg` the rail becomes a drawer; on desktop it collapses to an icon rail, and
+that choice is restored before first paint by the same script that restores the
+theme, so it never flashes open on load.
+
+The section list, the scroll-spy and the topbar label all read one `SECTIONS`
+array in `pushpak/web/app.js`, so a section cannot appear in the nav and be
+missing from the spy.
+
+`/api`, `/docs`, `/dashboard` and `/static` are deliberately not available as
+routes: nginx in production and `next.config.mjs` rewrites in development both
+hand those to FastAPI before Next sees them. That is what puts the whole
+prototype on **one port** — `:3000` in development, `:8080` in Docker — with no
+CORS anywhere.
 
 ## Data sources
 

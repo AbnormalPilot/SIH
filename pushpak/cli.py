@@ -1,11 +1,15 @@
 """Command-line entry point. Every component is demoable independently.
 
     python3 -m pushpak.cli robots-audit           # 1. show the ethical gate firing
+    python3 -m pushpak.cli discover               # 1. let a search engine pick the sources
     python3 -m pushpak.cli collect --mode hybrid  # 1. collect quotes
     python3 -m pushpak.cli seed --days 30         # 1. backfill a synthetic history
     python3 -m pushpak.cli index                  # 3. compute + store the index
     python3 -m pushpak.cli explain --date ...     # 3. reconstruct one number by hand
+    python3 -m pushpak.cli elementary             # 3. Dutot vs Jevons
+    python3 -m pushpak.cli adjust                 # 3. chain drift + seasonality
     python3 -m pushpak.cli validate               # 6. run the back-test
+    python3 -m pushpak.cli alerts                 # 1. operational alerts
     python3 -m pushpak.cli serve                  # 4+5. dashboard + API
     python3 -m pushpak.cli stats                  # data inventory
 """
@@ -59,6 +63,57 @@ def cmd_robots_audit(args) -> int:
             "data-sharing agreements. See config.OFFICIAL_DATA_CHANNELS.\n"
         )
     print(f"Snapshot written to {out}\n")
+    return 0
+
+
+def cmd_discover(args) -> int:
+    """Let Brave Search choose the sources, then gate every one it names.
+
+    The point is adversarial: the curated basket refuses, and this shows the
+    open web refuses too, on a list nobody here assembled.
+    """
+    from .collect import brave
+    from .collect.discover import discover, write_snapshot
+
+    if not brave.is_configured():
+        print(
+            f"{config.BRAVE_API_KEY_ENV} is not set, so there is nothing to "
+            "discover.\n\n"
+            "  export BRAVE_SEARCH_API_KEY=...    "
+            "(free key: https://api-dashboard.search.brave.com/)\n\n"
+            "The curated audit does not need it: python3 -m pushpak.cli robots-audit"
+        )
+        return 1
+
+    snap = discover(include_known=args.include_known)
+    write_snapshot(snap)
+
+    print(f"\nsource discovery  ({len(snap['queries'])} queries via Brave Search)\n")
+    for q in snap.get("query_log", []):
+        mark = "cached" if q["cached"] else "fetched"
+        detail = q["error"] or f"{q['n_results']} results"
+        print(f"  {mark:<8}{q['query'][:52]:<54}{detail}")
+
+    rows = snap["results"]
+    if not rows:
+        print("\nNo new hosts. Every fare page returned was already configured.")
+        return 0
+
+    print(f"\n{'host':<28}{'verdict':<10}{'rule / reason'}")
+    print("-" * 96)
+    for r in rows:
+        verdict = "ALLOW" if r["allowed"] else "REFUSE"
+        print(f"{r['source'][:26]:<28}{verdict:<10}{(r['rule'] or r['reason'])[:56]}")
+    print("-" * 96)
+    print(
+        f"{snap['n_permitted']}/{snap['n_sources']} newly discovered fare pages "
+        "permitted for automated collection."
+    )
+    print(f"\nwrote {config.DATA_DIR / 'robots_discovery_snapshot.json'}")
+    print(
+        "Brave supplied the addresses. It cannot supply fares: the index still "
+        "comes from the licensed API."
+    )
     return 0
 
 
@@ -276,6 +331,105 @@ def cmd_cpi(args) -> int:
     return 0
 
 
+def cmd_elementary(args) -> int:
+    """[3] Dutot vs Jevons, compiled from identical inputs."""
+    df = storage.load_quotes()
+    if not len(df):
+        print("No quotes. Run: python3 -m pushpak.cli seed --days 30", file=sys.stderr)
+        return 1
+    d = compute_index(df, elementary="dutot")
+    j = compute_index(df, elementary="jevons")
+    if not len(d.daily) or not len(j.daily):
+        print("No index computed.", file=sys.stderr)
+        return 1
+
+    m = d.daily[["period", "index_value"]].rename(columns={"index_value": "dutot"}).merge(
+        j.daily[["period", "index_value"]].rename(columns={"index_value": "jevons"}),
+        on="period",
+    )
+    m["diff"] = m["jevons"] - m["dutot"]
+
+    print("\nElementary aggregate sensitivity")
+    print("  Dutot  = ratio of ARITHMETIC mean cell prices  (the headline)")
+    print("  Jevons = ratio of GEOMETRIC  mean cell prices\n")
+    print(f"{'period':<12}{'dutot':>11}{'jevons':>11}{'difference':>13}")
+    print("-" * 47)
+    for r in m.tail(args.tail).itertuples():
+        print(f"{r.period:<12}{r.dutot:>11.4f}{r.jevons:>11.4f}{r.diff:>13.4f}")
+    print("-" * 47)
+    print(f"max |difference| over {len(m)} days: "
+          f"{m['diff'].abs().max():.4f} index points")
+    print("A small spread means the headline is robust to this choice.\n")
+    return 0
+
+
+def cmd_adjust(args) -> int:
+    """[3] Chain-linking drift and day-of-week seasonal adjustment."""
+    from .adjust import chain_report, seasonal_summary
+    res = _load_and_compute()
+    if res is None:
+        return 1
+
+    rep = chain_report(res)
+    print("\nChain-linking: the headline is FIXED-BASE and unchained.\n")
+    print(f"{'link freq':<10}{'form':<12}{'links':>7}{'final':>11}"
+          f"{'drift':>11}{'per-link':>11}")
+    print("-" * 62)
+    for v in rep["variants"]:
+        if not v.get("available"):
+            print(f"{v['link_frequency']:<10}{'-':<12}{'-':>7}  {v.get('reason','')}")
+            continue
+        print(f"{v['link_frequency']:<10}{v['link_form']:<12}{v['n_links']:>7}"
+              f"{v['chained_final']:>11.3f}{v['final_drift_index_points']:>+11.3f}"
+              f"{v['mean_link_excess_per_period_pct']:>+10.4f}%")
+    print("-" * 62)
+    if rep["least_drift"]:
+        ld = rep["least_drift"]
+        print(f"least drift: {ld['link_frequency']} / {ld['link_form']} "
+              f"({ld['final_drift_index_points']:+.3f} points)")
+    print(f"\n{rep['note']}\n")
+
+    ss = seasonal_summary(res.daily)
+    est = ss["estimation"]
+    if not est.get("available"):
+        print(f"Day-of-week adjustment unavailable: {est.get('reason')}\n")
+        return 0
+    print("Day-of-week seasonal factors "
+          "(ratio to centred 7-day moving average)\n")
+    print(f"{'day':<6}{'factor':>10}{'obs':>7}")
+    print("-" * 23)
+    for day, f in est["factors"].items():
+        print(f"{day:<6}{f:>10.4f}{est['observations_per_weekday'][day]:>7}")
+    print("-" * 23)
+    vr = ss.get("volatility_reduction", {})
+    if vr.get("stdev_raw") is not None:
+        print(f"stdev raw {vr['stdev_raw']:.4f} -> "
+              f"seasonally adjusted {vr['stdev_seasonally_adjusted']:.4f}")
+    print(f"\n{ss['annual_seasonality']}\n")
+    return 0
+
+
+def cmd_alerts(args) -> int:
+    """[1] Operational alerts raised by the scheduler."""
+    from . import alerts as alerts_mod
+    s = alerts_mod.summary()
+    rows = alerts_mod.recent(limit=args.limit, severity=args.severity)
+
+    print(f"\nAlerts   INFO {s['counts']['INFO']}  "
+          f"WARNING {s['counts']['WARNING']}  CRITICAL {s['counts']['CRITICAL']}")
+    print(f"webhook configured ({alerts_mod.WEBHOOK_ENV}): "
+          f"{s['webhook_configured']}\n")
+    if not rows:
+        print("No alerts recorded. Nothing has needed an operator's attention.\n")
+        return 0
+    print(f"{'ts':<22}{'severity':<10}{'source':<28}title")
+    print("-" * 100)
+    for r in rows:
+        print(f"{r['ts']:<22}{r['severity']:<10}{r['source']:<28}{r['title'][:38]}")
+    print()
+    return 0
+
+
 def cmd_schedule(args) -> int:
     from .scheduler import Scheduler
     sch = Scheduler(tick_seconds=args.tick, mode=args.mode)
@@ -301,6 +455,14 @@ def main(argv=None) -> int:
 
     sp = sub.add_parser("robots-audit", help="check robots.txt for every source")
     sp.set_defaults(func=cmd_robots_audit)
+
+    sp = sub.add_parser(
+        "discover",
+        help="let Brave Search pick fare sources, then gate every one",
+    )
+    sp.add_argument("--include-known", action="store_true",
+                    help="also report hosts already in config.SOURCES")
+    sp.set_defaults(func=cmd_discover)
 
     sp = sub.add_parser("collect", help="collect fare quotes")
     sp.add_argument("--mode", choices=("live", "api", "synthetic", "hybrid"),
@@ -347,6 +509,20 @@ def main(argv=None) -> int:
     sp.add_argument("--rebuild", action="store_true",
                     help="re-parse the MoSPI workbook into tidy CSVs")
     sp.set_defaults(func=cmd_cpi)
+
+    sp = sub.add_parser("elementary",
+                        help="[3] compare the Dutot and Jevons aggregates")
+    sp.add_argument("--tail", type=int, default=10)
+    sp.set_defaults(func=cmd_elementary)
+
+    sp = sub.add_parser("adjust",
+                        help="[3] chain-link drift and day-of-week adjustment")
+    sp.set_defaults(func=cmd_adjust)
+
+    sp = sub.add_parser("alerts", help="[1] operational alerts")
+    sp.add_argument("--limit", type=int, default=25)
+    sp.add_argument("--severity", choices=("INFO", "WARNING", "CRITICAL"))
+    sp.set_defaults(func=cmd_alerts)
 
     sp = sub.add_parser("schedule", help="[1] run collection and indexing on a schedule")
     sp.add_argument("--once", action="store_true", help="run due jobs and exit")

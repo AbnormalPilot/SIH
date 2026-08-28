@@ -5,6 +5,8 @@ data/pushpak.db
 data/pushpak.db-wal
 data/pushpak.db-shm
 data/scrape_audit.jsonl
+data/cache/
 web/node_modules/
-web/dist/
+web/.next/
+web/out/
 .DS_Store

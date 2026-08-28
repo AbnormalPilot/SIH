@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-26T18:33:37",
+  "generated_at": "2026-08-26T17:25:54+00:00",
   "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
   "policy": "fail-closed: unreachable robots.txt is treated as DISALLOWED",
   "results": [
@@ -16,7 +16,7 @@
       "crawl_delay": 6.0,
       "robots_status": null,
       "robots_bytes": 0,
-      "fetched_at": "2026-08-26T13:03:04+00:00",
+      "fetched_at": "2026-08-26T17:24:32+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed / NDC or direct MoU with MoSPI",
@@ -38,7 +38,7 @@
       "crawl_delay": 6.0,
       "robots_status": null,
       "robots_bytes": 0,
-      "fetched_at": "2026-08-26T13:03:19+00:00",
+      "fetched_at": "2026-08-26T17:24:48+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed / NDC or direct MoU with MoSPI",
@@ -60,7 +60,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 10884,
-      "fetched_at": "2026-08-26T13:03:35+00:00",
+      "fetched_at": "2026-08-26T17:25:03+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Skyscanner Partners - Flights Live Prices / Indicative Prices API",
@@ -82,7 +82,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 2141,
-      "fetched_at": "2026-08-26T13:03:35+00:00",
+      "fetched_at": "2026-08-26T17:25:04+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": null
     },
@@ -99,7 +99,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 1430,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-26T17:25:04+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": null
     },
@@ -116,7 +116,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 608,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-26T17:25:05+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed or MoU",
@@ -138,7 +138,7 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 133,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-26T17:25:05+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": {
         "channel": "Airline distribution feed or MoU",
@@ -160,9 +160,97 @@
       "crawl_delay": 6.0,
       "robots_status": 200,
       "robots_bytes": 547,
-      "fetched_at": "2026-08-26T13:03:36+00:00",
+      "fetched_at": "2026-08-26T17:25:06+00:00",
       "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
       "official_channel": null
+    },
+    {
+      "source": "airindiaexpress.com",
+      "source_type": "AIRLINE",
+      "sample_url": "https://www.airindiaexpress.com/booking/select-flight?origin=DEL&destination=BOM&departureDate=2026-09-15",
+      "url_pattern": "https://www.airindiaexpress.com/booking/select-flight?origin={origin}&destination={dest}&departureDate={travel_date}",
+      "url": "https://www.airindiaexpress.com/booking/select-flight?origin=DEL&destination=BOM&departureDate=2026-09-15",
+      "host": "www.airindiaexpress.com",
+      "allowed": true,
+      "reason": "ALLOWED",
+      "rule": null,
+      "crawl_delay": 6.0,
+      "robots_status": 200,
+      "robots_bytes": 392,
+      "fetched_at": "2026-08-26T17:25:06+00:00",
+      "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
+      "official_channel": {
+        "channel": "Airline distribution feed or MoU",
+        "url": "https://www.airindiaexpress.com",
+        "access": "CRAWLING_PERMITTED_BUT_NO_STATIC_FARES",
+        "note": "robots.txt permits the booking path. Verified 2026-08-26: the URL returns an 8 KB single-page-app shell with zero currency-shaped tokens and zero occurrences of the word 'flight'. Permission to crawl and availability of data are independent problems."
+      }
+    },
+    {
+      "source": "makemytrip.com",
+      "source_type": "OTA",
+      "sample_url": "https://www.makemytrip.com/flight/search?itinerary=DEL-BOM-2026-09-15&tripType=O&paxType=A-1&cabinClass=E",
+      "url_pattern": "https://www.makemytrip.com/flight/search?itinerary={origin}-{dest}-{travel_date}&tripType=O&paxType=A-1&cabinClass=E",
+      "url": "https://www.makemytrip.com/flight/search?itinerary=DEL-BOM-2026-09-15&tripType=O&paxType=A-1&cabinClass=E",
+      "host": "www.makemytrip.com",
+      "allowed": false,
+      "reason": "ROBOTS_UNREACHABLE",
+      "rule": "fail-closed policy: no affirmative permission obtained",
+      "crawl_delay": 6.0,
+      "robots_status": null,
+      "robots_bytes": 0,
+      "fetched_at": "2026-08-26T17:25:06+00:00",
+      "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
+      "official_channel": {
+        "channel": "MakeMyTrip affiliate / partner API",
+        "url": "https://www.makemytrip.com",
+        "access": "PARTNER_ONLY_APPLICATION_REQUIRED",
+        "note": "robots.txt itself is unreachable to a declared non-browser client, so the fail-closed gate refuses the source. No permission can be inferred from a document that cannot be read."
+      }
+    },
+    {
+      "source": "goibibo.com",
+      "source_type": "OTA",
+      "sample_url": "https://www.goibibo.com/flights/air-DEL-BOM-260915-1-0-0-E-D/",
+      "url_pattern": "https://www.goibibo.com/flights/air-{origin}-{dest}-{travel_date_compact}-1-0-0-E-D/",
+      "url": "https://www.goibibo.com/flights/air-DEL-BOM-260915-1-0-0-E-D/",
+      "host": "www.goibibo.com",
+      "allowed": false,
+      "reason": "ROBOTS_UNREACHABLE",
+      "rule": "fail-closed policy: no affirmative permission obtained",
+      "crawl_delay": 6.0,
+      "robots_status": null,
+      "robots_bytes": 0,
+      "fetched_at": "2026-08-26T17:25:21+00:00",
+      "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
+      "official_channel": {
+        "channel": "Goibibo (MakeMyTrip group) partner API",
+        "url": "https://www.goibibo.com",
+        "access": "PARTNER_ONLY_APPLICATION_REQUIRED",
+        "note": "robots.txt unreachable to a declared bot; gate fails closed."
+      }
+    },
+    {
+      "source": "yatra.com",
+      "source_type": "OTA",
+      "sample_url": "https://www.yatra.com/air-search-ui/dom2/trigger?type=O&origin=DEL&destination=BOM&flight_depart_date=2026-09-15&class=Economy&adults=1",
+      "url_pattern": "https://www.yatra.com/air-search-ui/dom2/trigger?type=O&origin={origin}&destination={dest}&flight_depart_date={travel_date}&class=Economy&adults=1",
+      "url": "https://www.yatra.com/air-search-ui/dom2/trigger?type=O&origin=DEL&destination=BOM&flight_depart_date=2026-09-15&class=Economy&adults=1",
+      "host": "www.yatra.com",
+      "allowed": false,
+      "reason": "ROBOTS_UNREACHABLE",
+      "rule": "fail-closed policy: no affirmative permission obtained",
+      "crawl_delay": 6.0,
+      "robots_status": null,
+      "robots_bytes": 0,
+      "fetched_at": "2026-08-26T17:25:38+00:00",
+      "user_agent": "Pushpak-Research-Bot/0.1 (MoSPI Airfare Price Index prototype; non-commercial statistical research; contact: diid-pushpak@example.gov.in)",
+      "official_channel": {
+        "channel": "Yatra partner / affiliate feed",
+        "url": "https://www.yatra.com",
+        "access": "PARTNER_ONLY_APPLICATION_REQUIRED",
+        "note": "robots.txt unreachable to a declared bot; gate fails closed."
+      }
     }
   ]
 }

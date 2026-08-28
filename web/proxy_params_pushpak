@@ -1,8 +1,0 @@
-proxy_set_header Host $host;
-proxy_set_header X-Real-IP $remote_addr;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-proxy_set_header X-Forwarded-Proto $scheme;
-# The API is stateless and reads no cookies. Dropping the header keeps an
-# oversized localhost cookie jar from hitting uvicorn's own header limits.
-proxy_set_header Cookie "";
-proxy_read_timeout 60s;

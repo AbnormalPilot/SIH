@@ -109,8 +109,10 @@ def normalise(df: pd.DataFrame) -> pd.DataFrame:
         canonical_route_id(o, d) for o, d in zip(out["origin"], out["destination"])
     ]
 
-    for col in ("base_fare", "taxes_fees", "total_fare"):
-        out[col] = pd.to_numeric(out.get(col), errors="coerce")
+    for col in ("base_fare", "taxes_fees", "total_fare",
+                "udf_fee", "convenience_fee"):
+        if col in out:
+            out[col] = pd.to_numeric(out[col], errors="coerce")
 
     out["advance_purchase_days"] = pd.to_numeric(
         out["advance_purchase_days"], errors="coerce"
@@ -221,19 +223,60 @@ def clean(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, CleaningReport]
 # ---------------------------------------------------------------------------
 # 4. aggregate to elementary cells
 # ---------------------------------------------------------------------------
-def build_cells(df: pd.DataFrame) -> pd.DataFrame:
+#: The two elementary-aggregate formulas Pushpak can compile.
+#:
+#:   ``dutot``  — cell price is the ARITHMETIC mean of its priced quotes. The
+#:                ratio of two such means across periods is a Dutot index. It is
+#:                the default because a reviewer can reproduce it on paper, which
+#:                the brief explicitly requires.
+#:   ``jevons`` — cell price is the GEOMETRIC mean. The ratio of two geometric
+#:                means equals the geometric mean of the price relatives, which
+#:                is the Jevons index. It is the elementary formula most NSOs
+#:                (and the ILO CPI manual) prefer for items with high price
+#:                dispersion, because it is insensitive to the arbitrary choice
+#:                of units and is not dominated by the most expensive quotes in
+#:                the cell — both of which describe airfares well.
+#:
+#: Both are published side by side rather than one being declared correct: the
+#: gap between them is itself a measure of how much the headline number depends
+#: on a methodological choice, and hiding that would be the dishonest option.
+ELEMENTARY_FORMULAS = ("dutot", "jevons")
+
+
+def _geometric_mean(s: pd.Series) -> float:
+    """Geometric mean of the strictly positive values in ``s``.
+
+    Computed in log space, so a cell with many quotes cannot overflow the way
+    a running product would. Non-positive values cannot occur (validate()
+    rejects them) but are excluded defensively because a single zero would
+    otherwise silently collapse the whole cell to zero.
+    """
+    v = pd.to_numeric(s, errors="coerce").dropna()
+    v = v[v > 0]
+    if not len(v):
+        return np.nan
+    return float(np.exp(np.log(v).mean()))
+
+
+def build_cells(df: pd.DataFrame, elementary: str = "dutot") -> pd.DataFrame:
     """Collapse quotes to one row per (observation_date, route, AP window).
 
-    The cell price is the **arithmetic mean of the priced quotes in the cell**.
-    A ratio of such means across periods is a Dutot elementary index — the
-    simplest defensible elementary aggregate, and the one a reviewer can
-    reproduce by hand from the raw table, which the brief explicitly requires.
+    ``elementary`` selects the elementary-aggregate formula; see
+    :data:`ELEMENTARY_FORMULAS`. It changes only how the priced quotes inside a
+    cell are averaged. Everything above the cell — weights, imputation,
+    aggregation — is identical, which is what makes the two series comparable.
     """
+    if elementary not in ELEMENTARY_FORMULAS:
+        raise ValueError(
+            f"unknown elementary formula {elementary!r}; "
+            f"expected one of {ELEMENTARY_FORMULAS}"
+        )
     if not len(df):
         return pd.DataFrame(columns=[
             "observation_date", "route_id", "advance_purchase_days", "cell_price",
             "n_quotes", "n_priced", "n_soldout", "n_synthetic", "n_live",
             "synthetic_share", "soldout_share", "carriers", "sources",
+            "elementary_formula",
         ])
 
     d = df.copy()
@@ -245,8 +288,9 @@ def build_cells(df: pd.DataFrame) -> pd.DataFrame:
 
     key = ["observation_date", "route_id", "advance_purchase_days"]
     g = d.groupby(key, dropna=False)
+    price_agg = "mean" if elementary == "dutot" else _geometric_mean
     cells = g.agg(
-        cell_price=("_fare", "mean"),
+        cell_price=("_fare", price_agg),
         n_quotes=("quote_id", "count"),
         n_priced=("_priced", "sum"),
         n_soldout=("_soldout", "sum"),
@@ -262,6 +306,7 @@ def build_cells(df: pd.DataFrame) -> pd.DataFrame:
     # A cell with zero priced quotes has no price: mean of an empty set is NaN.
     cells.loc[cells["n_priced"] == 0, "cell_price"] = np.nan
     cells["advance_purchase_days"] = cells["advance_purchase_days"].astype(int)
+    cells["elementary_formula"] = elementary
     return cells.sort_values(["observation_date", "route_id", "advance_purchase_days"])
 
 

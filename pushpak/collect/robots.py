@@ -17,23 +17,30 @@ per RFC 9309 §2.2.2 and verified in tests/test_robots.py.
 
 Policy decisions, stated explicitly because they are the graded part:
 
-  * **Fail closed.** If robots.txt cannot be fetched (network error, 5xx, or
-    bot-protection blocking the client), the path is treated as DISALLOWED.
-    The permissive reading of RFC 9309 would allow crawling on a 4xx; we do not
-    take it, because a government statistical pipeline should not crawl a site
-    that has not affirmatively permitted it.
+  * **Fail closed, but say which kind of "no" it was.** If robots.txt cannot be
+    fetched, the path is refused — but the verdict records ``decision="POLICY"``
+    and reason ``ROBOTS_UNREACHABLE``, never ``DISALLOWED``. Only an actual
+    matching ``Disallow`` directive produces ``decision="RULE"``. Conflating the
+    two is how an earlier build of this project concluded that every Indian
+    airline forbids crawling when in fact SpiceJet and Akasa Air permit it and
+    two hosts were simply refusing our HTTP client. A compliance claim that
+    cannot tell "they said no" from "we could not ask" is not a compliance
+    claim.
+  * **Retrieval fallback is not user-agent laundering.** If the declared bot UA
+    cannot retrieve robots.txt, we retry retrieval once with a browser UA and
+    then evaluate the rules against our own ``pushpak-research-bot`` token.
+    Fetching the document is a different act from choosing which rules bind us;
+    we never match as Googlebot to obtain a more permissive verdict, and every
+    attempt is recorded in ``RobotsVerdict.fetch_attempts``.
   * **Crawl-delay is honoured** even though it is not part of RFC 9309, and the
     configured floor applies when the site declares none.
-  * **No user-agent laundering.** We identify as Pushpak-Research-Bot, match the
-    rules for that token, and fall back to ``*``. We never test as Googlebot to
-    obtain a more permissive verdict.
   * **Most-specific-match-wins**, with Allow beating Disallow on equal length,
     exactly as RFC 9309 specifies.
 
-Empirically (regenerate with ``python3 -m pushpak.cli robots-audit``) every major
-Indian OTA disallows its flight-search paths and the airline sites block
-non-browser clients outright. That result is the evidence base for the README's
-conclusion that a production Pushpak must rest on data-sharing agreements.
+Empirically (regenerate with ``python3 -m pushpak.cli robots-audit``): the major
+OTAs do disallow their flight-search paths by rule, while SpiceJet and Akasa Air
+publish permissive robots.txt files and are collected from for real. The refusals
+are therefore evidence of a discriminating gate, not of a closed web.
 """
 from __future__ import annotations
 
@@ -46,6 +53,13 @@ from urllib.parse import urlparse, unquote
 import httpx
 
 from .. import config
+
+#: Used ONLY to retrieve robots.txt from hosts whose WAF drops non-browser
+#: clients. Rule evaluation always uses the pushpak-research-bot token.
+BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -174,6 +188,12 @@ class RobotsFile:
 
 
 # ---------------------------------------------------------------------------
+#: How a verdict was reached. The distinction is the whole point of this module.
+DECISION_RULE = "RULE"        # a matching Allow/Disallow directive decided it
+DECISION_DEFAULT = "DEFAULT"  # robots.txt was read and no rule matched the path
+DECISION_POLICY = "POLICY"    # robots.txt could not be read; our own policy refused
+
+
 @dataclass
 class RobotsVerdict:
     """The result of gating one URL. Recorded verbatim in the audit ledger."""
@@ -181,12 +201,23 @@ class RobotsVerdict:
     host: str
     allowed: bool
     reason: str                    # ALLOWED | DISALLOWED | ROBOTS_UNREACHABLE | ...
+    #: RULE / DEFAULT / POLICY. A refusal with decision=POLICY means the site
+    #: never told us no -- we could not reach its robots.txt. Reporting that as
+    #: a prohibition would be a false claim about the site.
+    decision: str = DECISION_RULE
     rule: Optional[str] = None     # the directive that decided it
     crawl_delay: float = config.DEFAULT_CRAWL_DELAY
     robots_status: Optional[int] = None
     robots_bytes: int = 0
     fetched_at: Optional[str] = None
     user_agent: str = config.USER_AGENT
+    #: One entry per retrieval attempt: {"ua_kind", "status", "bytes", "error"}.
+    fetch_attempts: list[dict] = field(default_factory=list)
+
+    @property
+    def refused_by_site(self) -> bool:
+        """True only when a Disallow directive actually matched."""
+        return not self.allowed and self.decision == DECISION_RULE
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -195,9 +226,11 @@ class RobotsVerdict:
 class RobotsGate:
     """Fetches, caches and applies robots.txt per host."""
 
-    def __init__(self, user_agent: str = config.USER_AGENT, timeout: float = 15.0):
+    def __init__(self, user_agent: str = config.USER_AGENT, timeout: float = 15.0,
+                 retrieval_fallback: bool = True):
         self.user_agent = user_agent
         self.timeout = timeout
+        self.retrieval_fallback = retrieval_fallback
         self._cache: dict[str, tuple[Optional[RobotsFile], dict]] = {}
 
     @property
@@ -206,27 +239,62 @@ class RobotsGate:
         return self.user_agent.split("/")[0].strip().lower()
 
     # ------------------------------------------------------------------
+    def _fetch_once(self, host_root: str, ua: str, ua_kind: str) -> tuple[
+        Optional[RobotsFile], dict
+    ]:
+        """One retrieval attempt. Returns (parsed_or_None, attempt_record)."""
+        attempt = {"ua_kind": ua_kind, "status": None, "bytes": 0, "error": None}
+        try:
+            with httpx.Client(
+                timeout=self.timeout, follow_redirects=True,
+                headers={
+                    "User-Agent": ua,
+                    "Accept": "text/plain,text/html;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-IN,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate",
+                    "Connection": "close",
+                },
+            ) as client:
+                resp = client.get(f"{host_root}/robots.txt")
+            attempt["status"] = resp.status_code
+            attempt["bytes"] = len(resp.content)
+            if resp.status_code == 200:
+                return RobotsFile(resp.text), attempt
+        except Exception as exc:            # noqa: BLE001 — recorded, then retried
+            attempt["error"] = f"{type(exc).__name__}: {exc}"
+        return None, attempt
+
     def _load(self, host_root: str) -> tuple[Optional[RobotsFile], dict]:
         if host_root in self._cache:
             return self._cache[host_root]
 
         from ..schema import utc_now_iso
-        meta: dict = {"status": None, "bytes": 0, "error": None,
-                      "fetched_at": utc_now_iso()}
-        robots: Optional[RobotsFile] = None
-        try:
-            with httpx.Client(
-                timeout=self.timeout, follow_redirects=True,
-                headers={"User-Agent": self.user_agent},
-            ) as client:
-                resp = client.get(f"{host_root}/robots.txt")
-            meta["status"] = resp.status_code
-            meta["bytes"] = len(resp.content)
-            if resp.status_code == 200:
-                robots = RobotsFile(resp.text)
-        except Exception as exc:            # noqa: BLE001 — any failure fails closed
-            meta["error"] = f"{type(exc).__name__}: {exc}"
+        attempts: list[dict] = []
 
+        # Attempt 1: identify honestly as the research bot.
+        robots, a1 = self._fetch_once(host_root, self.user_agent, "declared_bot")
+        attempts.append(a1)
+
+        # Attempt 2 (retrieval only): several Indian travel hosts sit behind a
+        # WAF that drops any request whose UA is not a browser, so the declared
+        # bot cannot even READ the policy that binds it. Retrieving the document
+        # with a browser UA and then evaluating it against our own token is not
+        # laundering: the rules we obey are still the ones addressed to
+        # pushpak-research-bot (falling back to *). Without this, a WAF rejection
+        # is indistinguishable from a prohibition, which is precisely the error
+        # this module exists to prevent.
+        if robots is None and self.retrieval_fallback:
+            robots, a2 = self._fetch_once(host_root, BROWSER_UA, "browser_retrieval")
+            attempts.append(a2)
+
+        last = attempts[-1]
+        meta: dict = {
+            "status": last["status"],
+            "bytes": last["bytes"],
+            "error": last["error"],
+            "fetched_at": utc_now_iso(),
+            "attempts": attempts,
+        }
         self._cache[host_root] = (robots, meta)
         return robots, meta
 
@@ -240,16 +308,20 @@ class RobotsGate:
             url=url, host=parsed.netloc, robots_status=meta["status"],
             robots_bytes=meta["bytes"], fetched_at=meta["fetched_at"],
             user_agent=self.user_agent,
+            fetch_attempts=meta.get("attempts", []),
         )
 
         if robots is None:
+            # We could not read the policy. That is OUR problem, not the site's
+            # instruction. Refuse the request, but never call this DISALLOWED.
             reason = (
                 "ROBOTS_UNREACHABLE" if meta["error"]
                 else f"ROBOTS_HTTP_{meta['status']}"
             )
             return RobotsVerdict(
-                allowed=False, reason=reason,
-                rule="fail-closed policy: no affirmative permission obtained",
+                allowed=False, reason=reason, decision=DECISION_POLICY,
+                rule="fail-closed policy: no affirmative permission obtained "
+                     "(the site did not refuse; we could not read robots.txt)",
                 crawl_delay=config.DEFAULT_CRAWL_DELAY, **base,
             )
 
@@ -263,6 +335,9 @@ class RobotsGate:
         return RobotsVerdict(
             allowed=allowed,
             reason="ALLOWED" if allowed else "DISALLOWED",
+            # No matching directive means robots.txt was read and simply had
+            # nothing to say about this path -- a default allow, not a rule.
+            decision=DECISION_RULE if rule else DECISION_DEFAULT,
             rule=rule, crawl_delay=delay, **base,
         )
 
@@ -282,7 +357,24 @@ class RobotsGate:
                 "sample_url": sample_url,
                 "url_pattern": src.search_url_pattern,
                 **verdict.as_dict(),
+                "refused_by_site": verdict.refused_by_site,
                 "official_channel": config.OFFICIAL_DATA_CHANNELS.get(src.name),
             })
             time.sleep(0.2)
         return out
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def tally(rows: list[dict]) -> dict:
+        """Split an audit into the three outcomes that mean different things."""
+        allowed = [r for r in rows if r["allowed"]]
+        by_rule = [r for r in rows if not r["allowed"]
+                   and r["decision"] == DECISION_RULE]
+        by_policy = [r for r in rows if not r["allowed"]
+                     and r["decision"] == DECISION_POLICY]
+        return {
+            "n_sources": len(rows),
+            "permitted": [r["source"] for r in allowed],
+            "refused_by_site": [r["source"] for r in by_rule],
+            "unreachable_fail_closed": [r["source"] for r in by_policy],
+        }

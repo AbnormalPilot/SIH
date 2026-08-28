@@ -86,7 +86,11 @@ def test_methodology_declares_weight_provenance(client):
     assert d["route_weights"]["provenance"] == "DGCA_DERIVED"
     assert d["advance_purchase_weights"]["provenance"] == "ASSUMED_PRIOR"
     assert "warning" in d["advance_purchase_weights"]
-    assert "chain-linking" in d["not_implemented"]
+    # Chain-linking and seasonal adjustment moved from "not implemented" to
+    # published-alongside variants; what remains unimplemented is listed with
+    # a reason rather than as a bare noun.
+    assert d["adjustments"]["chain_linking"]["available_at"]
+    assert any("quality adjustment" in x for x in d["not_implemented"])
 
 
 def test_provenance_endpoint_reports_every_collection_mode(client):
@@ -239,3 +243,116 @@ def test_dashboard_and_docs_render(client):
 def test_static_handler_rejects_path_traversal(client):
     r = client.get("/static/../../../etc/passwd")
     assert r.status_code in (404, 400)
+
+
+# ---------------------------------------------------------------------------
+# methodological sensitivity endpoints
+# ---------------------------------------------------------------------------
+def test_elementary_endpoint_publishes_both_formulas(client):
+    d = client.get("/api/v1/index/elementary").json()
+    assert d["headline_formula"] == "dutot"
+    assert d["n_periods"] > 0
+    assert len(d["series"]) == d["n_periods"]
+    row = d["series"][0]
+    assert {"period", "dutot", "jevons", "difference"} <= set(row)
+    assert row["difference"] == pytest.approx(row["jevons"] - row["dutot"], abs=1e-4)
+
+
+def test_elementary_endpoint_quantifies_the_spread(client):
+    """The point of the endpoint is the number, not the two series."""
+    d = client.get("/api/v1/index/elementary").json()
+    assert d["max_abs_spread_index_points"] >= d["mean_abs_spread_index_points"] >= 0
+
+
+def test_the_headline_index_is_the_dutot_series(client):
+    """The comparison must not quietly become the published number."""
+    headline = client.get("/api/v1/index?frequency=daily").json()
+    elem = client.get("/api/v1/index/elementary").json()
+    last_headline = headline["series"][-1]["index_value"]
+    assert elem["final"]["dutot"] == pytest.approx(last_headline, abs=1e-4)
+
+
+def test_chained_endpoint_reports_drift_against_the_headline(client):
+    d = client.get("/api/v1/index/chained").json()
+    assert d["headline_is_chained"] is False
+    assert "not a bug" in d["note"]
+    available = [v for v in d["variants"] if v.get("available")]
+    assert available, "at least the daily link must be computable"
+    for v in available:
+        assert v["link_frequency"] in ("daily", "weekly", "monthly")
+        assert v["link_form"] in ("arithmetic", "geometric")
+        assert "final_drift_index_points" in v
+
+
+def test_daily_arithmetic_chaining_drifts_more_than_geometric(client):
+    """The AM-GM bias, visible through the API."""
+    d = client.get("/api/v1/index/chained").json()
+    by = {(v["link_frequency"], v["link_form"]): v
+          for v in d["variants"] if v.get("available")}
+    a = by.get(("daily", "arithmetic"))
+    g = by.get(("daily", "geometric"))
+    assert a and g
+    assert a["mean_link_factor"] >= g["mean_link_factor"]
+
+
+def test_seasonal_endpoint_always_states_what_is_not_adjusted(client):
+    d = client.get("/api/v1/index/seasonal").json()
+    assert "12 months" in d["annual_seasonality"]
+    assert isinstance(d["applied"], bool)
+    if not d["applied"]:
+        assert d["estimation"]["reason"]
+
+
+def test_fare_classes_endpoint_names_the_indexed_cabin(client):
+    d = client.get("/api/v1/fare-classes").json()
+    assert d["indexed"] == config.INDEX_FARE_CLASS
+    assert d["indexed"] in d["supported_by_schema"]
+    assert set(d["collected_by_default"]) <= set(d["supported_by_schema"])
+    assert d["quotes_held_by_class"].get(config.INDEX_FARE_CLASS, 0) > 0
+
+
+# ---------------------------------------------------------------------------
+# methodology contract
+# ---------------------------------------------------------------------------
+def test_methodology_declares_the_adjustments_it_does_not_apply(client):
+    m = client.get("/api/v1/methodology").json()
+    assert m["adjustments"]["headline_is_adjusted"] is False
+    assert m["adjustments"]["chain_linking"]["available_at"] == "/api/v1/index/chained"
+    assert m["adjustments"]["seasonal_adjustment"]["available_at"] == "/api/v1/index/seasonal"
+    assert any("quality adjustment" in x for x in m["not_implemented"])
+
+
+def test_methodology_lists_every_indexed_window(client):
+    m = client.get("/api/v1/methodology").json()
+    assert m["advance_purchase_windows"] == list(config.ADVANCE_PURCHASE_WINDOWS)
+    assert set(int(k) for k in m["advance_purchase_weights"]["weights"]) == \
+        set(config.ADVANCE_PURCHASE_WINDOWS)
+
+
+def test_methodology_still_flags_the_assumed_ap_weights(client):
+    """Adding T+45 must not have quietly upgraded the provenance claim."""
+    m = client.get("/api/v1/methodology").json()
+    assert m["advance_purchase_weights"]["provenance"] == "ASSUMED_PRIOR"
+    assert "NOT an official statistic" in m["advance_purchase_weights"]["warning"]
+
+
+# ---------------------------------------------------------------------------
+# operations
+# ---------------------------------------------------------------------------
+def test_alerts_endpoint_is_queryable_when_nothing_has_happened(client):
+    d = client.get("/api/v1/alerts").json()
+    assert d["summary"]["counts"] == {"INFO": 0, "WARNING": 0, "CRITICAL": 0}
+    assert d["alerts"] == []
+    assert d["severities"] == ["INFO", "WARNING", "CRITICAL"]
+
+
+def test_alerts_endpoint_rejects_an_unknown_severity(client):
+    assert client.get("/api/v1/alerts?severity=PANIC").status_code == 422
+
+
+def test_schedule_endpoint_publishes_the_retry_policy(client):
+    d = client.get("/api/v1/schedule").json()
+    for job in d["jobs"]:
+        assert job["max_attempts"] >= 1
+        assert isinstance(job["retry_delays_seconds"], list)
+    assert "CRITICAL alert" in d["note"]

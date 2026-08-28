@@ -1,5 +1,6 @@
 **/node_modules
 **/dist
+**/.next
 **/__pycache__
 **/*.pyc
 .git
@@ -7,4 +8,5 @@ data/pushpak.db
 data/pushpak.db-wal
 data/pushpak.db-shm
 data/scrape_audit.jsonl
+data/cache
 web/node_modules

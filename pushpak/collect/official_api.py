@@ -141,6 +141,7 @@ class AmadeusCollector:
         routes: list[str],
         ap_windows: tuple[int, ...] = config.ADVANCE_PURCHASE_WINDOWS,
         max_offers: int = 20,
+        fare_class: str = config.INDEX_FARE_CLASS,
     ) -> Iterator[FareQuote]:
         if not self.configured:
             return
@@ -169,6 +170,7 @@ class AmadeusCollector:
                                 "adults": 1,
                                 "currencyCode": "INR",
                                 "nonStop": "true",
+                                "travelClass": fare_class,
                                 "max": max_offers,
                             },
                             headers={"Authorization": f"Bearer {token}"},
@@ -196,7 +198,7 @@ class AmadeusCollector:
                     for offer in (r.json().get("data") or []):
                         q = self._to_quote(
                             offer, origin, dest, route_id, observation_date,
-                            travel_date, ap, req_id,
+                            travel_date, ap, req_id, fare_class,
                         )
                         if q is not None:
                             yield q
@@ -204,7 +206,8 @@ class AmadeusCollector:
     # ------------------------------------------------------------------
     @staticmethod
     def _to_quote(offer, origin, dest, route_id, observation_date, travel_date,
-                  ap, req_id) -> Optional[FareQuote]:
+                  ap, req_id, fare_class=config.INDEX_FARE_CLASS
+                  ) -> Optional[FareQuote]:
         try:
             price = offer.get("price") or {}
             total = float(price.get("grandTotal") or price.get("total"))
@@ -230,8 +233,11 @@ class AmadeusCollector:
                 observation_date=observation_date.isoformat(),
                 travel_date=travel_date.isoformat(),
                 advance_purchase_days=ap,
-                fare_class="ECONOMY",
+                fare_class=fare_class,
                 base_fare=base, taxes_fees=taxes, total_fare=round(total, 2),
+                # Amadeus returns taxes only in aggregate on this endpoint, so
+                # the v1.1.0 itemisation fields stay NULL rather than guessed.
+                udf_fee=None, convenience_fee=None,
                 quote_status=QuoteStatus.OK,
                 flight_number=(
                     f"{seg.get('carrierCode','')}{seg.get('number','')}" if seg else None

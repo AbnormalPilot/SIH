@@ -36,6 +36,8 @@ CREATE TABLE IF NOT EXISTS fare_quotes (
     taxes_fees            REAL,
     total_fare            REAL,
     currency              TEXT NOT NULL,
+    udf_fee               REAL,           -- schema v1.1.0, NULL = not disclosed
+    convenience_fee       REAL,           -- schema v1.1.0, NULL = not disclosed
     quote_status          TEXT NOT NULL,
     is_imputed            INTEGER NOT NULL DEFAULT 0,
     imputation_method     TEXT NOT NULL DEFAULT 'NONE',
@@ -131,9 +133,34 @@ def connect(db_path: Optional[Path] = None) -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+#: Columns added after the first release, as (table, column, sql type).
+#: Applied by :func:`init_db` so an existing data/pushpak.db keeps working
+#: instead of failing on the next insert. SQLite has no IF NOT EXISTS for
+#: ADD COLUMN, so existence is checked first rather than exceptions swallowed.
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("fare_quotes", "udf_fee", "REAL"),
+    ("fare_quotes", "convenience_fee", "REAL"),
+    ("scheduled_runs", "attempt", "INTEGER NOT NULL DEFAULT 1"),
+    ("scheduled_runs", "max_attempts", "INTEGER NOT NULL DEFAULT 1"),
+)
+
+
+def apply_migrations(conn: sqlite3.Connection) -> list[str]:
+    applied = []
+    for table, column, sqltype in MIGRATIONS:
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if not cols:                     # table not created yet; schema covers it
+            continue
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sqltype}")
+            applied.append(f"{table}.{column}")
+    return applied
+
+
 def init_db(db_path: Optional[Path] = None) -> None:
     with connect(db_path) as conn:
         conn.executescript(SCHEMA_SQL)
+        apply_migrations(conn)
 
 
 def upsert_quotes(quotes: Iterable[FareQuote], db_path: Optional[Path] = None) -> int:

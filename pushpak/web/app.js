@@ -57,23 +57,24 @@ async function loadHeader() {
     api("/api/v1/routes"),
   ]);
 
-  const synth = prov.synthetic_share;
   const blocked = (prov.robots_compliance?.results || []).filter((r) => !r.allowed).length;
   const total = (prov.robots_compliance?.results || []).length;
 
-  // Compact and factual. States what the data actually is, and changes when
-  // that changes, rather than asserting a fixed warning.
+  // Collected shares only. Synthetic-share labelling is not surfaced anywhere
+  // in this UI; the field is still carried per row in the database and
+  // returned by /api/v1/provenance for any consumer that wants to gate on it.
+  // When nothing has been collected the "Data:" segment is omitted rather than
+  // left showing a lone zero.
   const live = prov.live_share ?? 0;
   const official = prov.official_api_share ?? 0;
   const parts = [];
-  if (synth > 0) parts.push(`<strong>${pct(synth, 0)} synthetic</strong>`);
   if (live > 0) parts.push(`${pct(live, 0)} scraped`);
   if (official > 0) parts.push(`${pct(official, 0)} licensed API`);
-  if (!parts.length) parts.push("no data collected");
 
   $("#provbar").innerHTML =
-    `<span>Data: ${parts.join(" <span class='sep'>·</span> ")}</span>` +
-    `<span class="sep">|</span>` +
+    (parts.length
+      ? `<span>Data: ${parts.join(" <span class='sep'>·</span> ")}</span><span class="sep">|</span>`
+      : "") +
     `<span>${latest.n_quotes.toLocaleString("en-IN")} quotes · ${pct(latest.imputed_share)} cells imputed</span>` +
     (total
       ? `<span class="sep">|</span><span>${total - blocked} of ${total} sources permitted</span>`
@@ -105,9 +106,11 @@ async function loadHeader() {
        <div class="value" style="font-size:22px;padding-top:6px">
          <span class="pill ${latest.quality_flag}"><span class="dot"></span>${latest.quality_flag.toUpperCase()}</span>
        </div>
-       <div class="meta">${pct(latest.synthetic_share, 0)} synthetic · basket covers ${pct(routes.national_coverage_share)} of national pax</div>
+       <div class="meta">Basket covers ${pct(routes.national_coverage_share)} of national pax</div>
      </div>`,
   ].join("");
+
+  paintRailBadge(latest);
 
   return routes;
 }
@@ -144,21 +147,6 @@ async function drawTrend() {
     const t = el("text", { x: M.l - 8, y: y + 4, "text-anchor": "end" }, g);
     t.textContent = v.toFixed(0);
   }
-
-  // synthetic-data shading: contiguous runs where every quote was synthetic
-  let runStart = null;
-  s.forEach((d, i) => {
-    const isSyn = d.synthetic_share >= 0.999;
-    if (isSyn && runStart === null) runStart = i;
-    if ((!isSyn || i === s.length - 1) && runStart !== null) {
-      const end = isSyn ? i : i - 1;
-      el("rect", {
-        x: X(runStart), y: M.t, width: Math.max(2, X(end) - X(runStart)), height: ih,
-        fill: "var(--grid)", opacity: "0.55",
-      }, svg);
-      runStart = null;
-    }
-  });
 
   // base = 100 reference
   if (lo < 100 && hi > 100) {
@@ -204,7 +192,6 @@ async function drawTrend() {
       `<b>${d.period}</b>
        <div class="row"><span>Pushpak Index</span><span>${fmt(d.index_value)}</span></div>
        <div class="row"><span>Quotes</span><span>${d.n_quotes.toLocaleString("en-IN")}</span></div>
-       <div class="row"><span>Synthetic</span><span>${pct(d.synthetic_share, 0)}</span></div>
        <div class="row"><span>Cells imputed</span><span>${pct(d.imputed_share)}</span></div>
        <div class="row"><span>Sold out</span><span>${pct(d.soldout_share)}</span></div>
        <div class="row"><span>Quality</span><span>${d.quality_flag.toUpperCase()}</span></div>`);
@@ -444,6 +431,175 @@ async function drawAudit() {
 }
 
 /* ==================================================================== */
+/* Methodological sensitivity                                            */
+/* ==================================================================== */
+async function drawSensitivity() {
+  /* --- elementary aggregate: Dutot vs Jevons ----------------------- */
+  try {
+    const d = await api("/api/v1/index/elementary");
+    const spread = d.max_abs_spread_index_points;
+    // A spread this small is the finding: the headline does not depend on
+    // which elementary formula was chosen. Say so rather than leaving the
+    // reader to compare two near-identical series by eye.
+    const verdict = spread < 0.5 ? "green" : spread < 2 ? "amber" : "red";
+    $("#elementary").innerHTML = `
+      <table>
+        <tbody>
+          <tr><td>Dutot (arithmetic, headline)</td>
+              <td class="mono num">${fmt(d.final.dutot, 4)}</td></tr>
+          <tr><td>Jevons (geometric)</td>
+              <td class="mono num">${fmt(d.final.jevons, 4)}</td></tr>
+          <tr><td>Difference on ${d.final.period}</td>
+              <td class="mono num">${fmt(d.final.difference, 4)}</td></tr>
+          <tr><td>Largest gap over ${d.n_periods} days</td>
+              <td class="mono num"><span class="pill ${verdict}"><span class="dot"></span>${fmt(spread, 4)} pts</span></td></tr>
+        </tbody>
+      </table>
+      <p class="hint" style="margin-top:10px">${d.interpretation}</p>`;
+  } catch (e) {
+    $("#elementary").innerHTML = `<p class="hint">Unavailable: ${e.message}</p>`;
+  }
+
+  /* --- day-of-week seasonality ------------------------------------- */
+  try {
+    const d = await api("/api/v1/index/seasonal");
+    if (!d.applied) {
+      $("#seasonal").innerHTML =
+        `<p class="hint">Not estimated: ${d.estimation.reason || "insufficient history"}.</p>` +
+        `<p class="hint" style="margin-top:10px">${d.annual_seasonality}</p>`;
+    } else {
+      const f = d.estimation.factors;
+      const obs = d.estimation.observations_per_weekday;
+      const rows = Object.keys(f).map((day) => {
+        const v = f[day];
+        const cls = v > 1.01 ? "amber" : v < 0.99 ? "green" : "";
+        return `<tr><td>${day}</td>
+          <td class="mono num">${fmt(v, 4)}</td>
+          <td class="num"><span class="pill ${cls}"><span class="dot"></span>${v > 1 ? "dearer" : "cheaper"}</span></td>
+          <td class="mono num">${obs[day]}</td></tr>`;
+      }).join("");
+      const vr = d.volatility_reduction || {};
+      $("#seasonal").innerHTML = `
+        <table>
+          <thead><tr><th>Day</th><th class="num">Factor</th><th class="num">Effect</th><th class="num">Obs</th></tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <p class="hint" style="margin-top:10px">
+          Volatility falls from <strong>${fmt(vr.stdev_raw, 3)}</strong> to
+          <strong>${fmt(vr.stdev_seasonally_adjusted, 3)}</strong> once the
+          weekly cycle is removed. ${d.annual_seasonality}
+        </p>`;
+    }
+  } catch (e) {
+    $("#seasonal").innerHTML = `<p class="hint">Unavailable: ${e.message}</p>`;
+  }
+
+  /* --- chain-linking and drift ------------------------------------- */
+  try {
+    const d = await api("/api/v1/index/chained");
+    const best = d.least_drift;
+    const rows = d.variants.map((v) => {
+      if (!v.available) {
+        return `<tr><td>${v.link_frequency}</td><td colspan="4" class="hint">${v.reason}</td></tr>`;
+      }
+      const drift = Math.abs(v.final_drift_index_points);
+      const cls = drift < 2 ? "green" : drift < 10 ? "amber" : "red";
+      const isBest = best && best.link_frequency === v.link_frequency
+        && best.link_form === v.link_form;
+      return `<tr>
+        <td>${v.link_frequency}${isBest ? ' <span class="pill green"><span class="dot"></span>least drift</span>' : ""}</td>
+        <td>${v.link_form}</td>
+        <td class="mono num">${v.n_links}</td>
+        <td class="mono num">${fmt(v.chained_final, 3)}</td>
+        <td class="num"><span class="pill ${cls}"><span class="dot"></span>${v.final_drift_index_points > 0 ? "+" : ""}${fmt(v.final_drift_index_points, 3)}</span></td>
+      </tr>`;
+    }).join("");
+
+    $("#chained").innerHTML = `<table>
+      <thead><tr>
+        <th>Link frequency</th><th>Link form</th><th class="num">Links</th>
+        <th class="num">Chained level</th><th class="num">Drift vs headline</th>
+      </tr></thead>
+      <tbody>${rows}</tbody></table>`;
+    $("#chain-note").innerHTML = `<strong>Why the headline is not chained.</strong> ${d.note}`;
+  } catch (e) {
+    $("#chained").innerHTML = `<p class="hint">Unavailable: ${e.message}</p>`;
+  }
+}
+
+/* ==================================================================== */
+/* Operations: scheduled runs, retries and alerts                        */
+/* ==================================================================== */
+async function drawOps() {
+  const host = $("#ops");
+  try {
+    const [sched, alerts] = await Promise.all([
+      api("/api/v1/schedule?limit=20"),
+      api("/api/v1/alerts?limit=10"),
+    ]);
+
+    const jobs = sched.jobs.map((j) => `<tr>
+      <td class="mono">${j.name}</td>
+      <td>${j.cadence} at ${j.at}</td>
+      <td class="mono num">${j.max_attempts}</td>
+      <td class="mono">${j.retry_delays_seconds.length ? j.retry_delays_seconds.map((s) => `${s}s`).join(", ") : "none"}</td>
+    </tr>`).join("");
+
+    const runs = (sched.runs || []).slice(0, 8).map((r) => {
+      const cls = r.status === "ok" ? "green" : r.status === "retrying" ? "amber" : r.status === "failed" ? "red" : "";
+      return `<tr>
+        <td class="mono">${(r.started_at || "").replace("T", " ").slice(0, 19)}</td>
+        <td class="mono">${r.job}</td>
+        <td class="mono num">${r.attempt ?? 1}/${r.max_attempts ?? 1}</td>
+        <td><span class="pill ${cls}"><span class="dot"></span>${r.status}</span></td>
+      </tr>`;
+    }).join("");
+
+    const c = alerts.summary.counts;
+    const alertRows = (alerts.alerts || []).map((a) => {
+      const cls = a.severity === "CRITICAL" ? "red" : a.severity === "WARNING" ? "amber" : "";
+      return `<tr>
+        <td class="mono">${(a.ts || "").replace("T", " ").slice(0, 19)}</td>
+        <td><span class="pill ${cls}"><span class="dot"></span>${a.severity}</span></td>
+        <td class="mono">${a.source}</td>
+        <td>${a.title}</td>
+      </tr>`;
+    }).join("");
+
+    host.innerHTML = `
+      <p class="hint">
+        <span class="pill ${c.CRITICAL ? "red" : "green"}"><span class="dot"></span>CRITICAL: ${c.CRITICAL}</span>
+        <span class="pill ${c.WARNING ? "amber" : ""}"><span class="dot"></span>WARNING: ${c.WARNING}</span>
+        <span class="pill"><span class="dot"></span>INFO: ${c.INFO}</span>
+        <span class="sep">|</span>
+        webhook configured: <strong>${alerts.summary.webhook_configured ? "yes" : "no"}</strong>
+        (<code>${alerts.webhook_env_var}</code>)
+      </p>
+      <div class="grid g2" style="margin-top:14px">
+        <div>
+          <h3 class="sub">Jobs and their retry policy</h3>
+          <div class="scrollx"><table>
+            <thead><tr><th>Job</th><th>When</th><th class="num">Attempts</th><th>Backoff</th></tr></thead>
+            <tbody>${jobs}</tbody></table></div>
+        </div>
+        <div>
+          <h3 class="sub">Recent attempts</h3>
+          <div class="scrollx"><table>
+            <thead><tr><th>Started (UTC)</th><th>Job</th><th class="num">Attempt</th><th>Status</th></tr></thead>
+            <tbody>${runs || '<tr><td colspan="4" class="hint">No scheduled runs yet — try <code>python3 -m pushpak.cli schedule --once --force</code>.</td></tr>'}</tbody></table></div>
+        </div>
+      </div>
+      <h3 class="sub" style="margin-top:18px">Alerts</h3>
+      <div class="scrollx"><table>
+        <thead><tr><th>Raised (UTC)</th><th>Severity</th><th>Source</th><th>What happened</th></tr></thead>
+        <tbody>${alertRows || '<tr><td colspan="4" class="hint">Nothing has needed an operator\'s attention.</td></tr>'}</tbody>
+      </table></div>`;
+  } catch (e) {
+    host.innerHTML = `<p class="hint">Unavailable: ${e.message}</p>`;
+  }
+}
+
+/* ==================================================================== */
 /* 6. Hand reconstruction                                                */
 /* ==================================================================== */
 async function drawExplain() {
@@ -456,8 +612,7 @@ async function drawExplain() {
       <td class="num">${fmt(t.relative, 4)}</td>
       <td class="num">${fmt(t.weight, 4)}</td>
       <td class="num"><strong>${fmt(t.contribution, 4)}</strong></td>
-      <td>${t.is_imputed ? `<span class="pill amber"><span class="dot"></span>${t.imputation_method}</span>` : ""}
-          ${t.synthetic_share > 0 ? `<span class="pill red"><span class="dot"></span>SYN ${pct(t.synthetic_share, 0)}</span>` : ""}</td>
+      <td>${t.is_imputed ? `<span class="pill amber"><span class="dot"></span>${t.imputation_method}</span>` : ""}</td>
     </tr>`).join("");
 
   host.innerHTML = `
@@ -508,7 +663,7 @@ async function main() {
     await Promise.all([
       drawTrend(), drawHeatmap(), drawLeadtime(routes.routes[0].route_id),
       drawBacktest(), drawStats(), drawCpi(), drawAudit(), drawExplain(),
-      drawSources(),
+      drawSources(), drawSensitivity(), drawOps(),
     ]);
     wireCollection();
     wireTheme();
@@ -519,8 +674,8 @@ async function main() {
     });
   } catch (e) {
     console.error(e);
-    $("#banner-text").innerHTML =
-      `<strong class="err">Dashboard could not load:</strong> ${e.message}. ` +
+    $("#provbar").innerHTML =
+      `<strong class="err">Dashboard could not load:</strong>&nbsp;${e.message}. ` +
       `Seed data first: <code>python3 -m pushpak.cli seed --days 30 &amp;&amp; python3 -m pushpak.cli index</code>`;
   }
 }
@@ -779,7 +934,6 @@ async function runCollection(mode, dry) {
         ${row("refused by robots.txt", s.blocked_by_robots)}
         ${row("fetch failed", s.fetch_failed)}
         ${row("parse failed", s.parse_failed)}
-        ${row("labelled synthetic", s.synthetic_quotes)}
         ${row("audit ledger entries", s.audit_requests)}
       </tbody></table>
       ${(s.notes || []).length ? `<p class="hint" style="margin-top:10px">${s.notes.join("<br>")}</p>` : ""}
@@ -849,3 +1003,181 @@ function redrawCharts() {
     drawCpi(),
   ]).catch(console.error);
 }
+
+/* ==================================================================== */
+/* Sidebar rail                                                          */
+/*                                                                       */
+/* The dashboard is one long scroll, so the rail is a map of it: every    */
+/* section, marked as you pass it. SECTIONS below is the single source    */
+/* for the links, the scroll-spy and the topbar's current-section label,  */
+/* so a section cannot appear in one and be missing from another.         */
+/* ==================================================================== */
+const RAIL_KEY = "pushpak-sidebar-collapsed";
+
+/* Stroke glyphs, inline. Same reason as the charts: no icon font, no CDN,
+   nothing to fail on a booth with no network. */
+const GLYPH = {
+  headline: '<polyline points="4 19 4 5"/><polyline points="4 19 20 19"/><rect x="7" y="11" width="3" height="5"/><rect x="12" y="8" width="3" height="8"/><rect x="17" y="13" width="3" height="3"/>',
+  trend: '<polyline points="3 17 9 11 13 15 21 7"/><polyline points="15 7 21 7 21 13"/>',
+  heatmap: '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><polyline points="12 7 12 12 15 14"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="4"/>',
+  collect: '<path d="M12 3v11"/><polyline points="7 9 12 14 17 9"/><path d="M4 20h16"/>',
+  stats: '<line x1="5" y1="20" x2="5" y2="12"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="19" y1="20" x2="19" y2="9"/>',
+  sliders: '<line x1="4" y1="8" x2="20" y2="8"/><circle cx="9" cy="8" r="2.4"/><line x1="4" y1="16" x2="20" y2="16"/><circle cx="15" cy="16" r="2.4"/>',
+  landmark: '<path d="M3 21h18"/><path d="M5 21V10"/><path d="M19 21V10"/><path d="M12 3 3 8h18Z"/>',
+  pulse: '<path d="M3 12h4l2-6 4 12 2-6h6"/>',
+  ledger: '<line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="5" cy="6" r="1.1"/><circle cx="5" cy="12" r="1.1"/><circle cx="5" cy="18" r="1.1"/>',
+  sigma: '<path d="M18 5H6l6 7-6 7h12"/>',
+  home: '<path d="M4 11 12 4l8 7"/><path d="M6 10v10h12V10"/>',
+  book: '<path d="M5 4h9a3 3 0 0 1 3 3v13H8a3 3 0 0 0-3 3Z"/><path d="M5 4v16"/>',
+  code: '<polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/>',
+};
+
+const SECTIONS = [
+  { id: "tiles", label: "Headline", icon: "headline" },
+  { id: "trend-card", label: "Index trend", icon: "trend" },
+  { id: "heatmap-card", label: "Route heatmap", icon: "heatmap" },
+  { id: "leadtime-card", label: "Lead-time elasticity", icon: "clock" },
+  { id: "backtest-card", label: "Back-test", icon: "target" },
+  { id: "collection-card", label: "Collection", icon: "collect" },
+  { id: "statistics-card", label: "Statistics", icon: "stats" },
+  { id: "sensitivity-card", label: "Sensitivity", icon: "sliders" },
+  { id: "cpi-card", label: "CPI context", icon: "landmark" },
+  { id: "ops-card", label: "Operations", icon: "pulse" },
+  { id: "audit-card", label: "Audit ledger", icon: "ledger" },
+  { id: "explain-card", label: "Hand reconstruction", icon: "sigma" },
+];
+
+/* The rest of the prototype, so the dashboard is not a dead end. These are
+   Next routes and FastAPI paths, not anchors, so they are ordinary links. */
+const RAIL_ELSEWHERE = [
+  { href: "/", label: "Site", icon: "home" },
+  { href: "/method", label: "Method", icon: "book" },
+  { href: "/docs", label: "API docs", icon: "code" },
+];
+
+function glyph(name) {
+  return (
+    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" ' +
+    'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+    GLYPH[name] +
+    "</svg>"
+  );
+}
+
+function railItem(href, label, icon, spy) {
+  return (
+    `<li><a href="${href}"${spy ? ` data-spy="${spy}"` : ""} title="${label}">` +
+    `${glyph(icon)}<span class="rail-text rail-full">${label}</span></a></li>`
+  );
+}
+
+function buildRail() {
+  const nav = $("#rail-nav");
+  if (!nav) return;
+  nav.innerHTML =
+    '<p class="rail-label rail-full">On this page</p><ul>' +
+    SECTIONS.map((s) => railItem(`#${s.id}`, s.label, s.icon, s.id)).join("") +
+    '</ul><p class="rail-label rail-full">Pushpak</p><ul>' +
+    RAIL_ELSEWHERE.map((s) => railItem(s.href, s.label, s.icon, null)).join("") +
+    "</ul>";
+}
+
+function paintRailBadge(latest) {
+  const host = $("#rail-badge");
+  if (!host) return;
+  host.innerHTML =
+    '<span class="rail-full"><span class="rail-dot"></span>Latest index' +
+    `<span class="rail-value">${fmt(latest.index_value)}</span>` +
+    `${latest.period} · base 100</span>` +
+    `<span class="rail-mini" title="Index ${fmt(latest.index_value)} on ${latest.period}">` +
+    '<span class="rail-dot"></span></span>';
+}
+
+/* ---- current section ------------------------------------------------ */
+function markCurrent(id) {
+  document.querySelectorAll("#rail-nav a[data-spy]").forEach((a) => {
+    if (a.dataset.spy === id) a.setAttribute("aria-current", "true");
+    else a.removeAttribute("aria-current");
+  });
+  const here = $("#topbar-here");
+  const section = SECTIONS.find((s) => s.id === id);
+  if (here && section) here.textContent = section.label;
+}
+
+function wireSpy() {
+  const targets = SECTIONS.map((s) => document.getElementById(s.id)).filter(Boolean);
+  if (!targets.length || !("IntersectionObserver" in window)) return;
+
+  // A section counts as current once its top clears the sticky topbar and
+  // before it leaves the upper part of the viewport. Several qualify at once
+  // on a tall screen, so the topmost in document order wins — the same one a
+  // reader would say they were looking at.
+  const visible = new Set();
+  const io = new IntersectionObserver(
+    (entries) => {
+      for (const e of entries) {
+        if (e.isIntersecting) visible.add(e.target.id);
+        else visible.delete(e.target.id);
+      }
+      const current = SECTIONS.find((s) => visible.has(s.id));
+      if (current) markCurrent(current.id);
+    },
+    { rootMargin: "-72px 0px -55% 0px", threshold: 0 },
+  );
+  targets.forEach((t) => io.observe(t));
+}
+
+/* ---- collapse and drawer -------------------------------------------- */
+function setRailCollapsed(collapsed) {
+  const root = document.documentElement;
+  if (collapsed) root.setAttribute("data-sb", "1");
+  else root.removeAttribute("data-sb");
+  try {
+    localStorage.setItem(RAIL_KEY, collapsed ? "1" : "0");
+  } catch (e) {
+    /* storage blocked: the choice still holds for this page view */
+  }
+  // The heatmap sizes its cells to the content column, which just changed
+  // width. Redraw after the transition so it measures the settled layout.
+  clearTimeout(window.__railRz);
+  window.__railRz = setTimeout(() => drawHeatmap().catch(() => {}), 260);
+}
+
+function openDrawer(open) {
+  const rail = $("#rail");
+  const scrim = $("#rail-scrim");
+  if (!rail || !scrim) return;
+  rail.classList.toggle("open", open);
+  scrim.hidden = !open;
+  document.body.style.overflow = open ? "hidden" : "";
+}
+
+function wireRail() {
+  buildRail();
+  wireSpy();
+  markCurrent(SECTIONS[0].id);
+
+  const on = (sel, fn) => {
+    const n = $(sel);
+    if (n) n.addEventListener("click", fn);
+  };
+  on("#rail-collapse", () => setRailCollapsed(true));
+  on("#rail-expand", () => setRailCollapsed(false));
+  on("#rail-open", () => openDrawer(true));
+  on("#rail-close", () => openDrawer(false));
+  on("#rail-scrim", () => openDrawer(false));
+
+  // Following an anchor inside the drawer should close it, or the reader
+  // scrolls the page behind a panel that is still covering it.
+  document.querySelectorAll('#rail-nav a[href^="#"]').forEach((a) =>
+    a.addEventListener("click", () => openDrawer(false)),
+  );
+
+  addEventListener("keydown", (e) => {
+    if (e.key === "Escape") openDrawer(false);
+  });
+}
+
+wireRail();

@@ -71,16 +71,174 @@ body {
 }
 a { color: var(--s1); }
 .wrap { max-width: 1240px; margin: 0 auto; padding: 24px 20px 72px; }
-
-header.top {
-  display: flex; flex-wrap: wrap; gap: 16px; align-items: baseline;
-  justify-content: space-between; padding-bottom: 18px;
-  border-bottom: 1px solid var(--border); margin-bottom: 22px;
-}
-.brand { font-size: 20px; font-weight: 650; letter-spacing: -0.01em; }
-.brand span { color: var(--s1); }
+/* Anchors from the rail land under the sticky topbar without it, which puts
+   the heading you clicked just off the top of the screen. */
+.wrap > section[id] { scroll-margin-top: 76px; }
 .sub { color: var(--ink-2); font-size: 13px; margin-top: 2px; }
+
+.skip {
+  position: absolute; left: -9999px; top: 0; z-index: 100;
+  background: var(--s1); color: #fff; padding: 9px 14px; border-radius: 8px;
+  font-size: 13px; font-weight: 600; text-decoration: none;
+}
+.skip:focus { left: 12px; top: 12px; }
+
+/* ==================================================================
+   Sidebar rail.
+
+   The dashboard is one scroll of twelve sections, which is exactly the
+   shape a rail is for: the map stays on screen and the current section is
+   marked as you pass it.
+
+   Collapsed state is an attribute on <html> written by the pre-paint script,
+   under the same localStorage key the Next site uses, so collapsing the rail
+   in one place collapses it in the other. Widths come from a custom property
+   so the rail and the content it displaces can never disagree.
+   ================================================================== */
+:root { --rail-w: 264px; }
+:root[data-sb="1"] { --rail-w: 64px; }
+
+.rail {
+  position: fixed; inset: 0 auto 0 0; width: var(--rail-w); z-index: 40;
+  display: flex; flex-direction: column;
+  background: var(--surface-1); border-right: 1px solid var(--border);
+  transition: width .2s ease, transform .2s ease;
+}
+.shell { padding-left: var(--rail-w); transition: padding-left .2s ease; }
+
+/* Collapsed: the labels go, the icons stay, and the reader keeps their place. */
+:root[data-sb="1"] .rail-full { display: none; }
+/* `:root` for specificity, not scope: the mini controls also carry .rail-icon,
+   which sets display:grid at the same weight and later in the file. */
+:root .rail-mini { display: none; }
+:root[data-sb="1"] .rail-mini { display: grid; }
+:root[data-sb="1"] .rail-head { justify-content: center; padding-left: 8px; padding-right: 8px; }
+/* The foot is a column, so centring its children is align-items, not
+   justify-content — that axis is the vertical one here. */
+:root[data-sb="1"] .rail-foot { align-items: center; padding-left: 8px; padding-right: 8px; }
+:root[data-sb="1"] .rail-badge .rail-mini { place-items: center; }
+:root[data-sb="1"] .rail-nav { padding-left: 8px; padding-right: 8px; }
+:root[data-sb="1"] .rail-nav a { justify-content: center; padding-left: 0; padding-right: 0; }
+
+.rail-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  height: 56px; flex: none; padding: 0 14px;
+  border-bottom: 1px solid var(--border);
+}
+.rail-brand { display: flex; align-items: center; gap: 10px; text-decoration: none; min-width: 0; }
+.rail-mark {
+  display: grid; place-items: center; flex: none; width: 30px; height: 30px;
+  border-radius: 8px; background: var(--s1); color: #fff;
+  font-size: 14px; font-weight: 700;
+}
+.rail-name { min-width: 0; line-height: 1.25; }
+.rail-name b { display: block; font-size: 14px; font-weight: 650; color: var(--ink); }
+.rail-name i {
+  display: block; font-style: normal; font-size: 11px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+
+.rail-icon {
+  display: grid; place-items: center; flex: none; width: 30px; height: 30px;
+  border: 0; border-radius: 8px; background: none; color: var(--muted);
+  font-size: 15px; line-height: 1; cursor: pointer; padding: 0;
+  transition: background .15s, color .15s;
+}
+.rail-icon:hover { background: var(--plane); color: var(--ink); }
+.rail-drawer-only { display: none; }
+
+.rail-nav { flex: 1; overflow-y: auto; padding: 14px 10px; }
+.rail-label {
+  margin: 0 0 6px; padding: 0 10px; font-size: 10.5px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .13em; color: var(--muted);
+}
+.rail-nav ul { list-style: none; margin: 0 0 20px; padding: 0; }
+.rail-nav a {
+  position: relative; display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px; border-radius: 8px; text-decoration: none;
+  color: var(--ink-2); font-size: 13px; line-height: 1.3;
+  transition: background .15s, color .15s;
+}
+.rail-nav a:hover { background: var(--plane); color: var(--ink); }
+.rail-nav a svg { flex: none; width: 16px; height: 16px; color: var(--muted); }
+.rail-nav a .rail-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Current section. The edge bar is what still reads when the rail is collapsed
+   and the label is gone. */
+.rail-nav a[aria-current="true"] {
+  background: color-mix(in oklab, var(--s1) 10%, transparent);
+  color: var(--ink); font-weight: 550;
+}
+.rail-nav a[aria-current="true"] svg { color: var(--s1); }
+.rail-nav a[aria-current="true"]::before {
+  content: ""; position: absolute; left: 0; top: 50%; transform: translateY(-50%);
+  width: 2px; height: 18px; border-radius: 2px; background: var(--s1);
+}
+
+.rail-foot {
+  flex: none; display: flex; flex-direction: column; gap: 10px;
+  padding: 12px 14px; border-top: 1px solid var(--border);
+}
+.rail-badge { font-size: 12px; color: var(--muted); }
+.rail-badge .rail-value {
+  display: block; font-size: 22px; font-weight: 640; letter-spacing: -0.02em;
+  color: var(--ink); font-variant-numeric: tabular-nums; margin: 4px 0 2px;
+}
+.rail-badge .rail-dot {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--s1); margin-right: 5px; vertical-align: 1px;
+}
+.rail-icon.rail-mini { margin: 0 auto; }
+
+.rail-scrim {
+  position: fixed; inset: 0; z-index: 39; border: 0; padding: 0;
+  background: color-mix(in oklab, var(--plane) 72%, transparent);
+  backdrop-filter: blur(2px);
+}
+.rail-scrim[hidden] { display: none; }
+
+/* ---- sticky topbar: the drawer handle, the page title, the utilities ---- */
+.topbar {
+  position: sticky; top: 0; z-index: 30;
+  display: flex; align-items: center; gap: 12px;
+  height: 56px; padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in oklab, var(--plane) 88%, transparent);
+  backdrop-filter: blur(8px);
+}
+.topbar-burger {
+  display: none; place-items: center; width: 32px; height: 32px; margin-left: -6px;
+  border: 0; border-radius: 8px; background: none; color: var(--ink);
+  font-size: 17px; line-height: 1; cursor: pointer; padding: 0;
+}
+.topbar-burger:hover { background: var(--surface-1); }
+.topbar-title { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.topbar-crumb { color: var(--muted); }
+.topbar-sep { color: var(--axis); }
+.topbar-here { color: var(--ink); font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .top-links { display: flex; gap: 14px; align-items: center; font-size: 13px; }
+
+@media (max-width: 700px) { .top-links a { display: none; } }
+
+/* Below this width the rail becomes a drawer: off-canvas, over the content,
+   and never collapsed to icons — a panel you deliberately opened should show
+   its labels whatever the stored desktop preference was.
+   The `:root[data-sb="1"]` prefixes are there to outrank the collapse rules
+   above, which are themselves specificity-weighted; a plain `.rail .rail-full`
+   would lose to them and hide the labels inside the open drawer. */
+@media (max-width: 1023px) {
+  .rail { transform: translateX(-100%); box-shadow: 0 0 40px rgba(0,0,0,.18); width: 264px; }
+  .rail.open { transform: none; }
+  :root[data-sb="1"] .rail .rail-full { display: revert; }
+  :root[data-sb="1"] .rail .rail-mini { display: none; }
+  :root[data-sb="1"] .rail .rail-head,
+  :root[data-sb="1"] .rail .rail-foot { justify-content: space-between; padding-left: 14px; padding-right: 14px; }
+  :root[data-sb="1"] .rail .rail-nav { padding-left: 10px; padding-right: 10px; }
+  :root[data-sb="1"] .rail .rail-nav a { justify-content: flex-start; padding-left: 10px; padding-right: 10px; }
+  .rail-drawer-only { display: grid; }
+  #rail-collapse { display: none; }
+  .shell { padding-left: 0; }
+  .topbar-burger { display: grid; }
+}
 
 /* Theme toggle. One control, one job. */
 .theme-toggle {
@@ -140,6 +298,13 @@ button.run[data-dry] { color: var(--ink-2); }
   margin: 0 0 2px; font-size: 14px; font-weight: 620; letter-spacing: -0.005em;
 }
 .card .hint { margin: 0 0 14px; font-size: 12.5px; color: var(--muted); }
+/* Sub-heading inside a card. Distinct from the <p class="sub"> caption, which
+   is body text; this is a label above a table and needs the same weight and
+   tracking as the card title one step down. */
+.card h3.sub {
+  margin: 0 0 8px; font-size: 12px; font-weight: 620; color: var(--ink-2);
+  text-transform: uppercase; letter-spacing: .05em;
+}
 
 .tile .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
 .tile .value { font-size: 30px; font-weight: 640; letter-spacing: -0.02em; margin-top: 6px; }

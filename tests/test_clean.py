@@ -312,3 +312,101 @@ def test_empty_input_does_not_explode():
     assert len(cells) == 0
     out = impute_cells(cells, pd.Series(dtype=float))
     assert len(out) == 0
+
+
+# ---------------------------------------------------------------------------
+# schema v1.1.0 — fee itemisation and fare classes
+# ---------------------------------------------------------------------------
+def test_fee_itemisation_defaults_to_null_not_zero():
+    """NULL means 'the source did not disclose it', which is not the same as 0."""
+    q = make_quote()
+    assert q.udf_fee is None
+    assert q.convenience_fee is None
+    assert q.validate() == []
+
+
+def test_itemised_fees_may_not_exceed_the_aggregate_they_decompose():
+    q = make_quote(total_fare=5000.0, udf_fee=400.0, convenience_fee=400.0)
+    errs = q.validate()
+    assert any("exceeds" in e for e in errs)
+
+
+def test_itemised_fees_within_the_aggregate_are_accepted():
+    q = make_quote(total_fare=5000.0, udf_fee=260.0, convenience_fee=199.0)
+    assert q.validate() == []
+
+
+def test_negative_itemised_fees_are_rejected():
+    assert any("itemised" in e for e in make_quote(udf_fee=-1.0).validate())
+
+
+def test_an_unpriced_quote_may_not_carry_fee_itemisation():
+    """SOLD_OUT means no price was observed, so no fee was observed either."""
+    q = make_quote(quote_status=QuoteStatus.SOLD_OUT, udf_fee=260.0)
+    assert any("NULL fee itemisation" in e for e in q.validate())
+
+
+def test_unknown_fare_classes_are_rejected():
+    assert any("fare_class" in e for e in make_quote(fare_class="STANDING").validate())
+
+
+def test_every_configured_fare_class_is_accepted_by_the_schema():
+    from pushpak import config as cfg
+    for fc in cfg.FARE_CLASSES:
+        assert make_quote(fare_class=fc).validate() == []
+
+
+def test_fee_columns_are_part_of_the_single_schema():
+    assert "udf_fee" in COLUMNS and "convenience_fee" in COLUMNS
+
+
+# ---------------------------------------------------------------------------
+# elementary aggregate formulas
+# ---------------------------------------------------------------------------
+def test_dutot_cell_price_is_the_arithmetic_mean():
+    quotes = [make_quote(total_fare=f, carrier=c)
+              for f, c in ((4000.0, "6E"), (5000.0, "AI"), (9000.0, "SG"))]
+    cells = build_cells(frame(quotes), elementary="dutot")
+    assert cells["cell_price"].iloc[0] == pytest.approx(6000.0)
+
+
+def test_jevons_cell_price_is_the_geometric_mean():
+    quotes = [make_quote(total_fare=f, carrier=c)
+              for f, c in ((4000.0, "6E"), (5000.0, "AI"), (9000.0, "SG"))]
+    cells = build_cells(frame(quotes), elementary="jevons")
+    assert cells["cell_price"].iloc[0] == pytest.approx((4000 * 5000 * 9000) ** (1 / 3))
+
+
+def test_geometric_mean_never_exceeds_the_arithmetic_mean():
+    """AM-GM. The property that makes the chain-drift diagnostic meaningful."""
+    quotes = [make_quote(total_fare=f, carrier=c)
+              for f, c in ((3000.0, "6E"), (5000.0, "AI"), (12000.0, "SG"))]
+    d = build_cells(frame(quotes), elementary="dutot")["cell_price"].iloc[0]
+    j = build_cells(frame(quotes), elementary="jevons")["cell_price"].iloc[0]
+    assert j < d
+
+
+def test_identical_quotes_make_the_two_formulas_agree():
+    quotes = [make_quote(total_fare=5000.0, carrier=c) for c in ("6E", "AI", "SG")]
+    d = build_cells(frame(quotes), elementary="dutot")["cell_price"].iloc[0]
+    j = build_cells(frame(quotes), elementary="jevons")["cell_price"].iloc[0]
+    assert d == pytest.approx(j) == pytest.approx(5000.0)
+
+
+def test_the_formula_used_is_recorded_on_every_cell():
+    cells = build_cells(frame([make_quote()]), elementary="jevons")
+    assert (cells["elementary_formula"] == "jevons").all()
+
+
+def test_an_unknown_elementary_formula_is_refused():
+    with pytest.raises(ValueError, match="elementary formula"):
+        build_cells(frame([make_quote()]), elementary="harmonic")
+
+
+def test_a_sold_out_cell_has_no_price_under_either_formula():
+    quotes = [make_quote(quote_status=QuoteStatus.SOLD_OUT, carrier=c)
+              for c in ("6E", "AI")]
+    for formula in ("dutot", "jevons"):
+        cells = build_cells(frame(quotes), elementary=formula)
+        assert pd.isna(cells["cell_price"].iloc[0])
+        assert cells["n_soldout"].iloc[0] == 2

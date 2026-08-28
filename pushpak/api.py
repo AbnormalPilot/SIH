@@ -80,6 +80,34 @@ def get_result() -> IndexResult:
     return _cache["result"]
 
 
+#: Variant index results (other elementary formulas / fare classes), keyed by
+#: (mtime, elementary, fare_class). Kept separate from ``_cache`` so that a
+#: request for a Jevons index can never be served the headline Dutot number.
+_variant_cache: dict[tuple, IndexResult] = {}
+
+
+def get_variant(elementary: str = "dutot",
+                fare_class: Optional[str] = None) -> IndexResult:
+    """A recomputed index under a different methodological choice."""
+    path = Path(config.DB_PATH)
+    if not path.exists():
+        raise HTTPException(503, "No database yet. Run: python3 -m pushpak.cli seed")
+    fc = config.INDEX_FARE_CLASS if fare_class is None else fare_class
+    key = (path.stat().st_mtime, elementary, fc)
+    if key not in _variant_cache:
+        df = storage.load_quotes()
+        if not len(df):
+            raise HTTPException(503, "No quotes collected yet. Run: pushpak.cli seed")
+        _variant_cache.clear()          # only ever hold one mtime's worth
+        try:
+            _variant_cache[key] = compute_index(
+                df, elementary=elementary, fare_class=fc
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    return _variant_cache[key]
+
+
 def _records(df: pd.DataFrame) -> list[dict]:
     return json.loads(df.to_json(orient="records", date_format="iso"))
 
@@ -118,7 +146,25 @@ def methodology() -> dict:
         ),
         "base_index_value": config.BASE_INDEX_VALUE,
         "base_period_days": config.BASE_PERIOD_DAYS,
-        "elementary_aggregate": "Dutot (ratio of arithmetic mean cell prices)",
+        "elementary_aggregate": {
+            "headline": "Dutot (ratio of arithmetic mean cell prices)",
+            "also_available": "Jevons (ratio of geometric mean cell prices)",
+            "compare_at": "/api/v1/index/elementary",
+            "why_dutot_is_the_headline": (
+                "hand-reconstructability, which the brief requires; the Jevons "
+                "series is published alongside so the choice is visible"
+            ),
+        },
+        "fare_class": {
+            "indexed": config.INDEX_FARE_CLASS,
+            "collected": list(config.COLLECT_FARE_CLASSES),
+            "supported": sorted(config.FARE_CLASSES),
+            "rule": (
+                "exactly one cabin per index; mixing cabins inside an "
+                "elementary aggregate would compare different products"
+            ),
+        },
+        "advance_purchase_windows": list(config.ADVANCE_PURCHASE_WINDOWS),
         "route_weights": {
             "provenance": config.ROUTE_WEIGHT_PROVENANCE,
             "source": "DGCA monthly domestic city-pair passenger statistics",
@@ -161,9 +207,34 @@ def methodology() -> dict:
                 "cell are re-flagged OUTLIER_REJECTED and retained for audit."
             ),
         },
+        "adjustments": {
+            "headline_is_adjusted": False,
+            "note": (
+                "The headline series is fixed-base, unchained and seasonally "
+                "unadjusted, because those properties are what make it "
+                "checkable by hand. Adjusted variants are published alongside "
+                "it and never in place of it."
+            ),
+            "chain_linking": {
+                "available_at": "/api/v1/index/chained",
+                "link_frequencies": ["daily", "weekly", "monthly"],
+                "link_forms": ["arithmetic (Laspeyres)", "geometric (Jevons)"],
+                "reports": "chain drift against the fixed-base headline",
+            },
+            "seasonal_adjustment": {
+                "available_at": "/api/v1/index/seasonal",
+                "estimated": "day-of-week cycle only, ratio-to-moving-average",
+                "not_estimated": (
+                    "annual and festival seasonality, which needs years of "
+                    "history this series does not have"
+                ),
+            },
+        },
         "not_implemented": [
-            "chain-linking", "seasonal adjustment", "quality adjustment",
-            "geometric (Jevons) elementary aggregation",
+            "quality adjustment (no hedonic or option-adjusted treatment of "
+            "fare-class attributes such as baggage or seat selection)",
+            "substitution between routes (the basket is fixed by construction)",
+            "annual or festival seasonal adjustment",
         ],
         "quality_thresholds": config.QUALITY_THRESHOLDS,
     }
@@ -556,8 +627,56 @@ def sources() -> dict:
         ),
         "sources": rows,
         "licensed_api": api_status(),
+        "discovery": discovery_status(),
         "refresh_verdicts_with": "python3 -m pushpak.cli robots-audit",
     }
+
+
+def discovery_status() -> dict:
+    """Summary of the last discovery run, for /api/v1/sources."""
+    from .collect import brave
+    from .collect.discover import load_snapshot
+
+    snap = load_snapshot()
+    return {
+        **brave.status(),
+        "last_run": (snap or {}).get("generated_at"),
+        "n_sources": (snap or {}).get("n_sources", 0),
+        "n_permitted": (snap or {}).get("n_permitted", 0),
+        "refresh_with": "python3 -m pushpak.cli discover",
+    }
+
+
+@app.get("/api/v1/discovery", tags=["collection"])
+def discovery() -> dict:
+    """Fare pages a search engine named, and what the robots gate said to each.
+
+    The curated basket in /api/v1/sources was assembled by hand, which is a
+    fair objection to its refusal rate. This endpoint answers it: the hosts
+    here were chosen by Brave Search from published queries, and gated by the
+    same fail-closed parser. Brave returns web results, never fares, so nothing
+    on this list can reach the index.
+
+    Empty until `python3 -m pushpak.cli discover` has run with a Brave API key.
+    """
+    from .collect import brave
+    from .collect.discover import load_snapshot
+
+    snap = load_snapshot()
+    if snap is None:
+        return {
+            "configured": brave.is_configured(),
+            "n_sources": 0,
+            "n_permitted": 0,
+            "results": [],
+            "queries": list(config.DISCOVERY_QUERIES),
+            "note": (
+                "No discovery snapshot yet. Set "
+                f"{config.BRAVE_API_KEY_ENV} and run "
+                "`python3 -m pushpak.cli discover`."
+            ),
+        }
+    return snap
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +777,146 @@ def cpi_statewise(
 
 
 # ---------------------------------------------------------------------------
+# Methodological sensitivity: how much does the headline depend on our choices?
+# ---------------------------------------------------------------------------
+@app.get("/api/v1/index/elementary", tags=["index"])
+def elementary_comparison() -> dict:
+    """Publish the Dutot and Jevons elementary aggregates side by side.
+
+    The headline index uses the arithmetic (Dutot) form because it is
+    hand-reconstructable. The geometric (Jevons) form is what most national
+    statistical offices prefer for dispersed prices. Both are compiled from
+    identical quotes, weights and imputation, so the gap between them measures
+    exactly one thing: how much the published number depends on that choice.
+    """
+    dutot = get_variant("dutot")
+    jevons = get_variant("jevons")
+    if not len(dutot.daily) or not len(jevons.daily):
+        raise HTTPException(404, "no index computed")
+
+    m = dutot.daily[["period", "index_value"]].rename(
+        columns={"index_value": "dutot"}
+    ).merge(
+        jevons.daily[["period", "index_value"]].rename(
+            columns={"index_value": "jevons"}
+        ),
+        on="period", how="inner",
+    )
+    spread = (m["jevons"] - m["dutot"]).abs()
+    return {
+        "headline_formula": "dutot",
+        "headline_reason": (
+            "a weighted arithmetic mean of relatives is the form a reviewer "
+            "can check on paper, which the brief requires"
+        ),
+        "n_periods": int(len(m)),
+        "max_abs_spread_index_points": round(float(spread.max()), 4),
+        "mean_abs_spread_index_points": round(float(spread.mean()), 4),
+        "final": {
+            "period": m["period"].iloc[-1],
+            "dutot": round(float(m["dutot"].iloc[-1]), 4),
+            "jevons": round(float(m["jevons"].iloc[-1]), 4),
+            "difference": round(float(m["jevons"].iloc[-1] - m["dutot"].iloc[-1]), 4),
+        },
+        "interpretation": (
+            "A small spread means the headline number is robust to the "
+            "elementary-formula choice. A large one means the choice is doing "
+            "real work and should be stated whenever the index is quoted."
+        ),
+        "series": [
+            {"period": r.period,
+             "dutot": round(float(r.dutot), 4),
+             "jevons": round(float(r.jevons), 4),
+             "difference": round(float(r.jevons - r.dutot), 4)}
+            for r in m.itertuples()
+        ],
+    }
+
+
+@app.get("/api/v1/index/chained", tags=["index"])
+def chained_index() -> dict:
+    """Chained variants of the index, and the drift each one costs.
+
+    The headline series is fixed-base and unchained. This endpoint chains it at
+    daily, weekly and monthly link frequencies under both an arithmetic
+    (Laspeyres) and a geometric (Jevons) link, and reports how far each result
+    ends up from the headline. The drift is the point of the endpoint.
+    """
+    from .adjust import chain_report
+    res = get_result()
+    if not len(res.daily):
+        raise HTTPException(404, "no index computed")
+    return chain_report(res)
+
+
+@app.get("/api/v1/index/seasonal", tags=["index"])
+def seasonal_index() -> dict:
+    """Day-of-week seasonal factors and the adjusted series.
+
+    Only the weekly cycle is removed. Annual and festival seasonality needs
+    years of history and is explicitly NOT estimated; the response says so.
+    """
+    from .adjust import seasonal_summary
+    res = get_result()
+    if not len(res.daily):
+        raise HTTPException(404, "no index computed")
+    return seasonal_summary(res.daily)
+
+
+@app.get("/api/v1/fare-classes", tags=["meta"])
+def fare_classes() -> dict:
+    """Which cabins the pipeline supports, collects, and indexes."""
+    counts: dict[str, int] = {}
+    try:
+        with storage.connect() as conn:
+            counts = {
+                r["fare_class"]: r["n"] for r in conn.execute(
+                    "SELECT fare_class, COUNT(*) AS n FROM fare_quotes "
+                    "GROUP BY fare_class"
+                )
+            }
+    except Exception:                                  # noqa: BLE001
+        counts = {}
+    return {
+        "supported_by_schema": sorted(config.FARE_CLASSES),
+        "collected_by_default": list(config.COLLECT_FARE_CLASSES),
+        "indexed": config.INDEX_FARE_CLASS,
+        "quotes_held_by_class": counts,
+        "note": (
+            "A business fare is a different product from an economy fare, not a "
+            "dearer one, so the index compiles exactly one cabin at a time. The "
+            "schema, collectors and index all carry fare_class end to end, so a "
+            "premium-cabin index is a configuration change, not a rewrite."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Operations
+# ---------------------------------------------------------------------------
+@app.get("/api/v1/alerts", tags=["meta"])
+def get_alerts(
+    limit: int = Query(50, le=500),
+    severity: Optional[str] = Query(None, pattern="^(INFO|WARNING|CRITICAL)$"),
+) -> dict:
+    """Operational alerts raised by the scheduler.
+
+    A pipeline that fails quietly keeps publishing plausible numbers from stale
+    data. Alerts are raised only for conditions an operator must act on --
+    exhausted job retries, a collection run that stored nothing, and a source
+    revoking crawl permission. Expected prototype states (synthetic quotes,
+    imputed cells) are reported through the index quality flag instead.
+    """
+    from . import alerts as alerts_mod
+    return {
+        "summary": alerts_mod.summary(),
+        "severities": list(alerts_mod.SEVERITIES),
+        "webhook_env_var": alerts_mod.WEBHOOK_ENV,
+        "alerts": alerts_mod.recent(limit=limit, severity=severity),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Scheduler
 # ---------------------------------------------------------------------------
 @app.get("/api/v1/schedule", tags=["meta"])
@@ -668,13 +927,19 @@ def schedule(limit: int = Query(50, le=500)) -> dict:
     return {
         "jobs": [
             {"name": j.name, "at": j.at,
-             "weekday": j.weekday, "cadence": "weekly" if j.weekday is not None else "daily"}
+             "weekday": j.weekday,
+             "cadence": "weekly" if j.weekday is not None else "daily",
+             "max_attempts": j.max_attempts,
+             "retry_delays_seconds": list(j.retry_delays)}
             for j in DEFAULT_JOBS
         ],
         "idempotent": True,
         "note": (
             "A job that already succeeded for a given run_date is skipped, so a "
-            "restart or a duplicate cron entry cannot double-collect."
+            "restart or a duplicate cron entry cannot double-collect. Each "
+            "attempt is its own row: check `attempt` and `max_attempts`. When "
+            "the last attempt fails, a CRITICAL alert is raised -- see "
+            "/api/v1/alerts."
         ),
         "n_runs": len(runs),
         "runs": runs,

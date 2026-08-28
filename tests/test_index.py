@@ -5,6 +5,7 @@ The index is the number a reviewer will challenge, so these tests pin down its
 price change, correct weighting, scale invariance, and exact reconciliation
 between the published value and its per-cell decomposition.
 """
+import json
 from datetime import date, timedelta
 
 import numpy as np
@@ -284,3 +285,115 @@ def test_all_synthetic_data_can_never_be_flagged_green():
     """The labelling guarantee, enforced at the index layer."""
     for imputed in (0.0, 0.05, 0.2, 0.9):
         assert quality_flag(1.0, imputed) != "green"
+
+
+# ---------------------------------------------------------------------------
+# basket and windows
+# ---------------------------------------------------------------------------
+def test_every_advance_purchase_window_carries_a_weight():
+    """A window in the basket with no weight would be silently dropped."""
+    for window in config.ADVANCE_PURCHASE_WINDOWS:
+        assert window in config.AP_WINDOW_WEIGHTS, f"T+{window} has no weight"
+
+
+def test_advance_purchase_weights_sum_to_one():
+    assert sum(config.AP_WINDOW_WEIGHTS.values()) == pytest.approx(1.0)
+    assert sum(ap_weights().values()) == pytest.approx(1.0)
+
+
+def test_cell_weights_cover_every_route_and_window():
+    rw = load_route_weights()
+    w = cell_weights(rw)
+    assert len(w) == len(rw) * len(config.ADVANCE_PURCHASE_WINDOWS)
+    assert w.sum() == pytest.approx(1.0)
+
+
+def test_the_basket_is_the_top_n_by_dgca_traffic():
+    """The selection rule must be mechanical, so nobody can cherry-pick it."""
+    rw = load_route_weights().sort_values("annual_pax", ascending=False)
+    assert len(rw) == config.BASKET_SIZE
+    assert rw["annual_pax"].is_monotonic_decreasing
+
+
+# ---------------------------------------------------------------------------
+# elementary formula and fare class
+# ---------------------------------------------------------------------------
+def _cabin_series(prices_by_day, ap=7, route=("DEL", "BOM"), **kw):
+    quotes = []
+    for day, fares in prices_by_day.items():
+        obs = date.fromisoformat(day)
+        for i, f in enumerate(fares):
+            quotes.append(make_quote(
+                origin=route[0], destination=route[1],
+                observation_date=day,
+                travel_date=(obs + timedelta(days=ap)).isoformat(),
+                advance_purchase_days=ap, total_fare=f,
+                carrier=("6E", "AI", "SG", "QP", "IX")[i % 5], **kw,
+            ))
+    return frame(quotes)
+
+
+def test_both_elementary_formulas_start_the_index_at_base():
+    df = _cabin_series({"2026-08-01": [5000.0, 6000.0], "2026-08-02": [5200.0, 6100.0]})
+    w = pd.DataFrame([{"route_id": "BOM-DEL", "weight": 1.0}])
+    for formula in ("dutot", "jevons"):
+        res = compute_index(df, route_weights=w, windows=(7,), base_days=1,
+                            elementary=formula)
+        assert res.daily["index_value"].iloc[0] == pytest.approx(100.0)
+
+
+def test_the_elementary_formula_is_recorded_on_the_result():
+    df = _cabin_series({"2026-08-01": [5000.0], "2026-08-02": [5200.0]})
+    w = pd.DataFrame([{"route_id": "BOM-DEL", "weight": 1.0}])
+    res = compute_index(df, route_weights=w, windows=(7,), base_days=1,
+                        elementary="jevons")
+    assert res.elementary == "jevons"
+    assert res.report["elementary_formula"] == "jevons"
+    assert json.loads(res.daily["detail_json"].iloc[0])["elementary_formula"] == "jevons"
+
+
+def test_an_unknown_elementary_formula_is_refused_by_the_index():
+    df = _cabin_series({"2026-08-01": [5000.0]})
+    w = pd.DataFrame([{"route_id": "BOM-DEL", "weight": 1.0}])
+    with pytest.raises(ValueError, match="elementary formula"):
+        compute_index(df, route_weights=w, windows=(7,), elementary="harmonic")
+
+
+def test_the_index_compiles_one_cabin_at_a_time():
+    """A business fare must not be averaged into an economy elementary cell."""
+    eco = _cabin_series({"2026-08-01": [5000.0], "2026-08-02": [5500.0]},
+                  fare_class="ECONOMY")
+    biz = _cabin_series({"2026-08-01": [20000.0], "2026-08-02": [20000.0]},
+                  fare_class="BUSINESS")
+    df = pd.concat([eco, biz], ignore_index=True)
+    w = pd.DataFrame([{"route_id": "BOM-DEL", "weight": 1.0}])
+
+    economy = compute_index(df, route_weights=w, windows=(7,), base_days=1,
+                            fare_class="ECONOMY")
+    business = compute_index(df, route_weights=w, windows=(7,), base_days=1,
+                             fare_class="BUSINESS")
+    # Economy rose 10%; business was flat. Mixing them would give neither.
+    assert economy.daily["index_value"].iloc[-1] == pytest.approx(110.0)
+    assert business.daily["index_value"].iloc[-1] == pytest.approx(100.0)
+    assert economy.fare_class == "ECONOMY"
+
+
+def test_the_indexed_fare_class_is_recorded():
+    df = _cabin_series({"2026-08-01": [5000.0], "2026-08-02": [5200.0]})
+    w = pd.DataFrame([{"route_id": "BOM-DEL", "weight": 1.0}])
+    res = compute_index(df, route_weights=w, windows=(7,), base_days=1)
+    assert res.fare_class == config.INDEX_FARE_CLASS
+    assert res.report["fare_class"] == config.INDEX_FARE_CLASS
+
+
+def test_a_filter_matching_nothing_returns_an_empty_but_usable_frame():
+    """An unpopulated cabin must give an empty result, not a KeyError."""
+    df = _cabin_series({"2026-08-01": [5000.0], "2026-08-02": [5200.0]})
+    w = pd.DataFrame([{"route_id": "BOM-DEL", "weight": 1.0}])
+    res = compute_index(df, route_weights=w, windows=(7,), fare_class="BUSINESS")
+    assert len(res.daily) == 0
+    assert "period" in res.daily.columns
+    assert "index_value" in res.daily.columns
+    assert len(res.resample("weekly")) == 0
+    assert len(res.route_daily) == 0
+    assert "route_id" in res.route_daily.columns

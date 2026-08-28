@@ -2,17 +2,23 @@
 
 A fixed-basket, Laspeyres-style price index, deliberately kept simple enough
 that a reviewer can reconstruct any published number by hand from the raw
-quote table. No chain-linking, no seasonal adjustment: the brief asks for a
-legible prototype, and both would obscure the arithmetic.
+quote table.
+
+The **headline** number published by this module is unchained and seasonally
+unadjusted, because those are the properties that make it hand-checkable.
+Chain-linked and day-of-week-adjusted variants live in :mod:`pushpak.adjust`
+and are published *alongside* the headline series, never in place of it, so
+that no adjustment can quietly move a number a reader is trying to verify.
 
 The formula
 -----------
 Two levels of aggregation, exactly as CPI compilation does it.
 
 **Level 1 — elementary aggregate (one cell).**
-A cell is one (route x advance-purchase window). Its price on day *t* is the
-arithmetic mean of the priced quotes in it (see clean.build_cells). Its
-*price relative* is
+A cell is one (route x advance-purchase window) for a single fare class. Its
+price on day *t* is the arithmetic mean of the priced quotes in it by default,
+or their geometric mean under ``elementary="jevons"`` (see clean.build_cells).
+Its *price relative* is
 
     R(c,t) = P(c,t) / P(c,0)
 
@@ -37,12 +43,24 @@ weighted sum: multiply each cell's relative by ``w(r) x v(a)``, add them up,
 multiply by 100. ``explain()`` prints exactly that table, term by term, so the
 "reconstruct it by hand" requirement is a function call rather than a promise.
 
-Why arithmetic (Dutot/Laspeyres) and not geometric (Jevons)
------------------------------------------------------------
-A geometric elementary aggregate is arguably better behaved for airfares.
-It is not used here because the brief asks for hand-reconstructability, and a
-weighted arithmetic mean of relatives is the form a reader can check on paper.
-The trade-off is noted in the README's limitations.
+Arithmetic (Dutot) by default, geometric (Jevons) on request
+------------------------------------------------------------
+The default elementary aggregate is arithmetic, because a weighted arithmetic
+mean of relatives is the form a reader can check on paper and the brief asks
+for hand-reconstructability. A geometric (Jevons) aggregate is arguably better
+behaved for a product with airfares' price dispersion, so it is implemented too
+and can be compiled from the identical inputs by passing
+``elementary="jevons"``. Neither is declared correct: the API publishes both
+and reports the spread between them, because the size of that spread is how
+much the headline number depends on a methodological choice, and a reader is
+entitled to know it.
+
+One cabin at a time
+-------------------
+A business fare is a different product from an economy fare, not a dearer
+version of one, so mixing cabins inside a single elementary aggregate would
+compare unlike with unlike. ``compute_index`` filters to one ``fare_class``
+(default ``config.INDEX_FARE_CLASS``) and records which one on every row.
 
 Provenance is a first-class output
 ----------------------------------
@@ -60,7 +78,7 @@ import numpy as np
 import pandas as pd
 
 from . import config
-from .clean import build_cells, clean, impute_cells
+from .clean import ELEMENTARY_FORMULAS, build_cells, clean, impute_cells
 from .schema import ImputationMethod, utc_now_iso
 
 
@@ -147,6 +165,22 @@ def quality_flag(synthetic_share: float, imputed_share: float) -> str:
     return "red"
 
 
+#: Column order of ``IndexResult.daily``. Declared so that an empty result
+#: still has the right shape: a filter that matches nothing (an unpopulated
+#: fare class, a date range with no quotes) must return an empty frame the
+#: caller can still index into, not a bare DataFrame that raises KeyError.
+DAILY_COLUMNS: tuple[str, ...] = (
+    "period", "frequency", "index_value", "n_quotes", "n_cells",
+    "n_cells_imputed", "synthetic_share", "imputed_share", "soldout_share",
+    "quality_flag", "weight_coverage", "computed_at", "detail_json",
+)
+
+ROUTE_DAILY_COLUMNS: tuple[str, ...] = (
+    "period", "frequency", "route_id", "index_value", "mean_fare", "weight",
+    "n_quotes", "imputed_share",
+)
+
+
 # ---------------------------------------------------------------------------
 @dataclass
 class IndexResult:
@@ -157,6 +191,8 @@ class IndexResult:
     base_dates: list[str]
     weights: pd.Series
     report: dict = field(default_factory=dict)
+    elementary: str = "dutot"
+    fare_class: str = config.INDEX_FARE_CLASS
 
     def resample(self, frequency: str) -> pd.DataFrame:
         """Aggregate the daily index to weekly or monthly.
@@ -214,8 +250,25 @@ def compute_index(
     windows=config.ADVANCE_PURCHASE_WINDOWS,
     base_days: int = config.BASE_PERIOD_DAYS,
     already_clean: bool = False,
+    elementary: str = "dutot",
+    fare_class: Optional[str] = None,
 ) -> IndexResult:
-    """Full pipeline: quotes -> cleaned cells -> imputed cells -> Pushpak Index series."""
+    """Full pipeline: quotes -> cleaned cells -> imputed cells -> Pushpak Index series.
+
+    ``elementary`` picks the elementary-aggregate formula (``dutot`` or
+    ``jevons``); see :data:`pushpak.clean.ELEMENTARY_FORMULAS`.
+
+    ``fare_class`` restricts the index to one cabin, defaulting to
+    ``config.INDEX_FARE_CLASS``. Mixing cabins inside one elementary aggregate
+    would compare different products, so the filter is applied here rather than
+    left to the caller. Pass ``fare_class=""`` to disable it deliberately.
+    """
+    if elementary not in ELEMENTARY_FORMULAS:
+        raise ValueError(
+            f"unknown elementary formula {elementary!r}; "
+            f"expected one of {ELEMENTARY_FORMULAS}"
+        )
+    fare_class = config.INDEX_FARE_CLASS if fare_class is None else fare_class
     rw = route_weights if route_weights is not None else load_route_weights()
     w = cell_weights(rw, windows)
 
@@ -230,8 +283,10 @@ def compute_index(
         cleaned["route_id"].isin(basket_routes)
         & cleaned["advance_purchase_days"].isin(list(windows))
     ]
+    if fare_class and "fare_class" in cleaned.columns:
+        cleaned = cleaned[cleaned["fare_class"].astype(str) == fare_class]
 
-    cells = build_cells(cleaned)
+    cells = build_cells(cleaned, elementary=elementary)
     base_prices, base_dates = compute_base_prices(cells, base_days)
     cells = impute_cells(cells, base_prices)
 
@@ -279,6 +334,8 @@ def compute_index(
                 "base_dates": base_dates,
                 "route_weight_provenance": config.ROUTE_WEIGHT_PROVENANCE,
                 "ap_weight_provenance": config.AP_WINDOW_WEIGHT_PROVENANCE,
+                "elementary_formula": elementary,
+                "fare_class": fare_class or "ALL",
             }),
         })
 
@@ -300,8 +357,14 @@ def compute_index(
                 "imputed_share": float(rg["is_imputed"].sum() / len(rg)),
             })
 
-    daily = pd.DataFrame(daily_rows).sort_values("period").reset_index(drop=True)
-    route_daily = pd.DataFrame(route_rows).sort_values(["period", "route_id"]).reset_index(drop=True)
+    daily = (
+        pd.DataFrame(daily_rows).sort_values("period").reset_index(drop=True)
+        if daily_rows else pd.DataFrame(columns=list(DAILY_COLUMNS))
+    )
+    route_daily = (
+        pd.DataFrame(route_rows).sort_values(["period", "route_id"]).reset_index(drop=True)
+        if route_rows else pd.DataFrame(columns=list(ROUTE_DAILY_COLUMNS))
+    )
 
     report.update({
         "base_dates": base_dates,
@@ -311,11 +374,15 @@ def compute_index(
         "n_cells_usable": len(usable),
         "route_weight_provenance": config.ROUTE_WEIGHT_PROVENANCE,
         "ap_weight_provenance": config.AP_WINDOW_WEIGHT_PROVENANCE,
+        "elementary_formula": elementary,
+        "fare_class": fare_class or "ALL",
+        "advance_purchase_windows": list(windows),
     })
 
     return IndexResult(
         daily=daily, route_daily=route_daily, cells=cells,
         base_prices=base_prices, base_dates=base_dates, weights=w, report=report,
+        elementary=elementary, fare_class=fare_class or "ALL",
     )
 
 

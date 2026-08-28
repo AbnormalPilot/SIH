@@ -55,15 +55,41 @@ from ..schema import (
 
 GENERATOR_VERSION = "synthetic-v1"
 
-# Approximate great-circle distances (km) for the basket, used to scale fares
-# so that the relative price level across routes is not arbitrary.
-ROUTE_DISTANCE_KM = {
-    "BOM-DEL": 1148,
-    "BLR-DEL": 1740,
-    "BLR-BOM": 842,
-    "DEL-HYD": 1253,
-    "CCU-DEL": 1305,
+# Airport coordinates (WGS-84, from the airports' published AIP entries).
+# Distances are COMPUTED from these by haversine rather than hand-typed, so
+# adding a route to the basket needs one coordinate pair and no magic numbers,
+# and a reviewer can re-derive every distance in the table.
+AIRPORT_COORDS: dict[str, tuple[float, float]] = {
+    "DEL": (28.5665, 77.1031),
+    "BOM": (19.0887, 72.8679),
+    "BLR": (13.1979, 77.7063),
+    "HYD": (17.2403, 78.4294),
+    "CCU": (22.6547, 88.4467),
+    "MAA": (12.9941, 80.1709),
+    "PNQ": (18.5821, 73.9197),
+    "AMD": (23.0772, 72.6347),
 }
+EARTH_RADIUS_KM = 6371.0
+
+
+def great_circle_km(a: str, b: str) -> float:
+    """Haversine distance between two IATA codes in AIRPORT_COORDS."""
+    (la1, lo1), (la2, lo2) = AIRPORT_COORDS[a], AIRPORT_COORDS[b]
+    p1, p2 = math.radians(la1), math.radians(la2)
+    dp, dl = p2 - p1, math.radians(lo2 - lo1)
+    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(h))
+
+
+def route_distance_km(route_id: str) -> Optional[float]:
+    """Distance for a canonical route id, or None if either end is unmapped."""
+    try:
+        a, b = route_id.split("-")
+    except ValueError:
+        return None
+    if a not in AIRPORT_COORDS or b not in AIRPORT_COORDS:
+        return None
+    return great_circle_km(a, b)
 
 # INR/km anchor plus a fixed leg cost, giving plausible economy fare levels.
 FARE_PER_KM = 2.65
@@ -115,9 +141,29 @@ SOURCE_STANDS_IN_FOR = {
     "synthetic-ota-b": "an OTA feed (ixigo/EaseMyTrip-like)",
 }
 
+# Cabin price positioning relative to economy on the same flight. Applied to
+# the whole fare, so the advance-purchase and day-of-week shapes carry over.
+FARE_CLASS_FACTOR = {
+    "ECONOMY": 1.00,
+    "PREMIUM_ECONOMY": 1.62,
+    "BUSINESS": 2.85,
+}
+#: Business cabins are smaller, so they sell out sooner at the same demand.
+FARE_CLASS_SOLDOUT_FACTOR = {
+    "ECONOMY": 1.00,
+    "PREMIUM_ECONOMY": 1.25,
+    "BUSINESS": 1.45,
+}
+
 FLIGHTS_PER_ROUTE_CARRIER = 3
 TAX_GST_RATE = 0.05          # GST on domestic economy tickets
 TAX_FIXED_FEES = 480.0       # UDF + PSF + aviation security fee, approx.
+
+# Itemisation of TAX_FIXED_FEES. The generator knows its own split, so it
+# discloses it -- which is what exercises the schema v1.1.0 fields end to end.
+# A real scraped page does not disclose this, and those rows keep NULLs.
+UDF_COMPONENT = 260.0        # User Development Fee share of TAX_FIXED_FEES
+OTA_CONVENIENCE_FEE = 199.0  # charged by the two synthetic OTA sources only
 
 
 def _stable_rng(*parts: object) -> random.Random:
@@ -128,7 +174,9 @@ def _stable_rng(*parts: object) -> random.Random:
 
 
 def route_base_fare(route_id: str) -> float:
-    km = ROUTE_DISTANCE_KM.get(route_id, 1200)
+    km = route_distance_km(route_id)
+    if km is None:
+        km = 1200.0            # fallback for an unmapped pair; see AIRPORT_COORDS
     return FARE_FIXED_LEG + FARE_PER_KM * km
 
 
@@ -164,10 +212,13 @@ def _seasonal(travel_date: date) -> float:
     return 1.0 + 0.045 * math.sin(2 * math.pi * (doy - 30) / 365.0)
 
 
-def _soldout_probability(ap_days: int, price_ratio: float) -> float:
-    """Rises into departure and with relative price."""
+def _soldout_probability(
+    ap_days: int, price_ratio: float, fare_class: str = "ECONOMY"
+) -> float:
+    """Rises into departure, with relative price, and in smaller cabins."""
     near = math.exp(-ap_days / 6.0)          # ~0.85 at T+1, ~0.006 at T+30
-    return min(0.45, 0.30 * near + 0.10 * max(0.0, price_ratio - 1.15))
+    p = 0.30 * near + 0.10 * max(0.0, price_ratio - 1.15)
+    return min(0.55, p * FARE_CLASS_SOLDOUT_FACTOR.get(fare_class, 1.0))
 
 
 def generate_quotes(
@@ -176,12 +227,17 @@ def generate_quotes(
     ap_windows: tuple[int, ...] = config.ADVANCE_PURCHASE_WINDOWS,
     sources: Optional[list[str]] = None,
     carriers: Optional[list[str]] = None,
+    fare_classes: Optional[tuple[str, ...]] = None,
     seed: int = 20260826,
     scrape_ts: Optional[str] = None,
 ) -> Iterator[FareQuote]:
     """Yield one observation day's worth of clearly-labelled synthetic quotes."""
     sources = sources or list(SOURCE_FACTOR)
     carriers = carriers or list(CARRIER_FACTOR)
+    fare_classes = tuple(fare_classes or config.COLLECT_FARE_CLASSES)
+    unknown = set(fare_classes) - set(FARE_CLASS_FACTOR)
+    if unknown:
+        raise ValueError(f"no synthetic price model for fare classes {sorted(unknown)}")
     ts = scrape_ts or datetime.combine(
         observation_date, datetime.min.time(), tzinfo=timezone.utc
     ).isoformat(timespec="seconds")
@@ -212,62 +268,83 @@ def generate_quotes(
 
                         for source in sources:
                             sfac = SOURCE_FACTOR[source]
-                            # Small per-observation noise; seeded on the
-                            # observation date so re-runs reproduce exactly.
-                            nrng = _stable_rng(
-                                seed, "obs", observation_date.isoformat(),
-                                route_id, origin, carrier, flight_ix, source, ap,
-                            )
-                            noise = nrng.gauss(1.0, 0.035)
-
-                            total = (
-                                base * ap_factor(ap) * dow * spike * season
-                                * cfac * sfac * flight_premium * max(0.75, noise)
-                            )
-                            price_ratio = total / (base * ap_factor(ap))
-
-                            status = QuoteStatus.OK
-                            if nrng.random() < _soldout_probability(ap, price_ratio):
-                                status = QuoteStatus.SOLD_OUT
-                            elif nrng.random() < 0.004:
-                                status = QuoteStatus.CANCELLED
-
-                            if status is QuoteStatus.OK:
-                                total = round(total, 0)
-                                taxes = round(
-                                    total * TAX_GST_RATE / (1 + TAX_GST_RATE)
-                                    + TAX_FIXED_FEES, 0
+                            is_ota = "ota" in source
+                            for fare_class in fare_classes:
+                                kfac = FARE_CLASS_FACTOR[fare_class]
+                                # Small per-observation noise; seeded on the
+                                # observation date so re-runs reproduce exactly.
+                                nrng = _stable_rng(
+                                    seed, "obs", observation_date.isoformat(),
+                                    route_id, origin, carrier, flight_ix, source,
+                                    ap, fare_class,
                                 )
-                                taxes = min(taxes, total - 500.0)
-                                base_fare = round(total - taxes, 0)
-                            else:
-                                total = base_fare = taxes = None
+                                noise = nrng.gauss(1.0, 0.035)
 
-                            yield FareQuote(
-                                origin=origin,
-                                destination=dest,
-                                route_id=canonical_route_id(origin, dest),
-                                carrier=carrier,
-                                source=source,
-                                source_type=SOURCE_TYPES[source],
-                                collection_mode=CollectionMode.SYNTHETIC,
-                                scrape_ts=ts,
-                                observation_date=observation_date.isoformat(),
-                                travel_date=travel_date.isoformat(),
-                                advance_purchase_days=ap,
-                                fare_class="ECONOMY",
-                                base_fare=base_fare,
-                                taxes_fees=taxes,
-                                total_fare=total,
-                                quote_status=status,
-                                flight_number=flight_no,
-                                departure_time=f"{dep_hour:02d}:{dep_min:02d}",
-                                stops=0,
-                                notes=(
-                                    f"SYNTHETIC ({GENERATOR_VERSION}); stands in for "
-                                    f"{SOURCE_STANDS_IN_FOR[source]}; not a real quote"
-                                ),
-                            )
+                                total = (
+                                    base * ap_factor(ap) * dow * spike * season
+                                    * cfac * sfac * kfac * flight_premium
+                                    * max(0.75, noise)
+                                )
+                                # Ratio against this cabin's own reference level,
+                                # so a business fare is not read as an economy
+                                # outlier by the sold-out model.
+                                price_ratio = total / (base * ap_factor(ap) * kfac)
+
+                                status = QuoteStatus.OK
+                                if nrng.random() < _soldout_probability(
+                                    ap, price_ratio, fare_class
+                                ):
+                                    status = QuoteStatus.SOLD_OUT
+                                elif nrng.random() < 0.004:
+                                    status = QuoteStatus.CANCELLED
+
+                                udf = convenience = None
+                                if status is QuoteStatus.OK:
+                                    total = round(total, 0)
+                                    taxes = round(
+                                        total * TAX_GST_RATE / (1 + TAX_GST_RATE)
+                                        + TAX_FIXED_FEES
+                                        + (OTA_CONVENIENCE_FEE if is_ota else 0.0), 0
+                                    )
+                                    taxes = min(taxes, total - 500.0)
+                                    base_fare = round(total - taxes, 0)
+                                    # Disclose the split only when it actually
+                                    # fits inside the aggregate -- the cap above
+                                    # can shrink taxes below the components.
+                                    conv = OTA_CONVENIENCE_FEE if is_ota else 0.0
+                                    if UDF_COMPONENT + conv <= taxes:
+                                        udf = UDF_COMPONENT
+                                        convenience = conv if is_ota else None
+                                else:
+                                    total = base_fare = taxes = None
+
+                                yield FareQuote(
+                                    origin=origin,
+                                    destination=dest,
+                                    route_id=canonical_route_id(origin, dest),
+                                    carrier=carrier,
+                                    source=source,
+                                    source_type=SOURCE_TYPES[source],
+                                    collection_mode=CollectionMode.SYNTHETIC,
+                                    scrape_ts=ts,
+                                    observation_date=observation_date.isoformat(),
+                                    travel_date=travel_date.isoformat(),
+                                    advance_purchase_days=ap,
+                                    fare_class=fare_class,
+                                    base_fare=base_fare,
+                                    taxes_fees=taxes,
+                                    total_fare=total,
+                                    udf_fee=udf,
+                                    convenience_fee=convenience,
+                                    quote_status=status,
+                                    flight_number=flight_no,
+                                    departure_time=f"{dep_hour:02d}:{dep_min:02d}",
+                                    stops=0,
+                                    notes=(
+                                        f"SYNTHETIC ({GENERATOR_VERSION}); stands in for "
+                                        f"{SOURCE_STANDS_IN_FOR[source]}; not a real quote"
+                                    ),
+                                )
 
 
 def generate_backfill(

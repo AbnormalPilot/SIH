@@ -1,7 +1,7 @@
 # Pushpak Index — one command per demoable component.
 PY ?= python3
 
-.PHONY: help install dev weights robots scrape collect seed index explain stats cpi validate schedule serve test demo docker docker-down clean
+.PHONY: help install dev weights robots discover scrape collect seed index explain stats cpi validate schedule serve test demo docker docker-down clean
 
 help:      ## show this help
 	@grep -E '^[a-z-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-13s\033[0m %s\n", $$1, $$2}'
@@ -10,7 +10,7 @@ install:   ## install python and node dependencies
 	$(PY) -m pip install -r requirements.txt
 	cd web && npm install
 
-dev:       ## run API (reload) + landing dev server together
+dev:       ## run API (reload) + the Next.js dev server together
 	./scripts/dev.sh
 
 # ---- component 1: collection -------------------------------------------
@@ -19,6 +19,9 @@ weights:   ## [1] re-derive route weights from the DGCA release
 
 robots:    ## [1] show the robots.txt gate verdict for every source
 	$(PY) -m pushpak.cli robots-audit
+
+discover:  ## [1] let Brave Search pick fare sources, then gate every one
+	$(PY) -m pushpak.cli discover
 
 scrape:    ## [1] live scraping only, no synthetic fill
 	$(PY) -m pushpak.cli scrape
